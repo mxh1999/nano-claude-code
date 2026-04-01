@@ -1,9 +1,10 @@
 
 
 <div align="center">
-  <a href="https://github.com/SafeRL-Lab/nano-claude-code">
-    <img src="https://github.com/SafeRL-Lab/nano-claude-code/blob/main/docs/demo.gif" alt="Logo" width="800"> 
+  <a href="[https://github.com/SafeRL-Lab/Robust-Gymnasium](https://github.com/SafeRL-Lab/nano-claude-code)">
+    <img src="https://github.com/SafeRL-Lab/nano-claude-code/blob/main/docs/logo-v1.png" alt="Logo" width="280"> 
   </a>
+
   
 <h1 align="center" style="font-size: 30px;"><strong><em>Nano Claude Code</em></strong>: A Minimal Python Reimplementation</h1>
 <p align="center">
@@ -12,6 +13,13 @@
     <a href="https://github.com/SafeRL-Lab/nano-claude-code/issues">Issue</a>
   </p>
 </div>
+
+ <div align=center>
+ <img src="https://github.com/SafeRL-Lab/nano-claude-code/blob/main/docs/demo.gif" width="850"/> 
+ </div>
+<div align=center>
+<center style="color:#000000;text-decoration:underline"> </center>
+ </div>
 
 
 ## 🔥🔥🔥 News (Pacific Time)
