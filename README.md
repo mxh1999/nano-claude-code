@@ -15,7 +15,9 @@
 
 
 ## 🔥🔥🔥 News (Pacific Time)
-- Apr 01, 2026: Support more closed-source models and open-source models: **Claude, GPT, Gemini, Kimi, Qwen, Zhipu, DeepSeek, and local open-source models via Ollama or any OpenAI-compatible endpoint.**
+- 01:47 PM, Apr 01, 2026: Support VLLM inference (~2000 lines of Python Code)
+- 11:30 AM, Apr 01, 2026: Support more closed-source models and open-source models: **Claude, GPT, Gemini, Kimi, Qwen, Zhipu, DeepSeek, and local open-source models via Ollama or any OpenAI-compatible endpoint.** (~1700 lines of Python Code)
+- 08:23 AM, Apr 01, 2026: Release the initial version of Nano Claude Code (~900 lines of Python Code)
 
 
 # Nano Claude Code
