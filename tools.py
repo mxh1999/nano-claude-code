@@ -2,6 +2,7 @@
 import os
 import re
 import glob as _glob
+import difflib
 import subprocess
 from pathlib import Path
 from typing import Callable, Optional
@@ -145,6 +146,24 @@ def _is_safe_bash(cmd: str) -> bool:
     return any(c.startswith(p) for p in _SAFE_PREFIXES)
 
 
+# ── Diff helpers ──────────────────────────────────────────────────────────
+
+def generate_unified_diff(old, new, filename, context_lines=3):
+    old_lines = old.splitlines(keepends=True)
+    new_lines = new.splitlines(keepends=True)
+    diff = difflib.unified_diff(old_lines, new_lines,
+        fromfile=f"a/{filename}", tofile=f"b/{filename}", n=context_lines)
+    return "".join(diff)
+
+def maybe_truncate_diff(diff_text, max_lines=80):
+    lines = diff_text.splitlines()
+    if len(lines) <= max_lines:
+        return diff_text
+    shown = lines[:max_lines]
+    remaining = len(lines) - max_lines
+    return "\n".join(shown) + f"\n\n[... {remaining} more lines ...]"
+
+
 # ── Tool implementations ───────────────────────────────────────────────────
 
 def _read(file_path: str, limit: int = None, offset: int = None) -> str:
@@ -167,10 +186,17 @@ def _read(file_path: str, limit: int = None, offset: int = None) -> str:
 def _write(file_path: str, content: str) -> str:
     p = Path(file_path)
     try:
+        is_new = not p.exists()
+        old_content = "" if is_new else p.read_text(errors="replace")
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
-        lc = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
-        return f"Wrote {lc} lines to {file_path}"
+        if is_new:
+            lc = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
+            return f"Created {file_path} ({lc} lines)"
+        filename = p.name
+        diff = generate_unified_diff(old_content, content, filename)
+        truncated = maybe_truncate_diff(diff)
+        return f"File updated — {file_path}:\n\n{truncated}"
     except Exception as e:
         return f"Error: {e}"
 
@@ -187,10 +213,13 @@ def _edit(file_path: str, old_string: str, new_string: str, replace_all: bool = 
         if count > 1 and not replace_all:
             return (f"Error: old_string appears {count} times. "
                     "Provide more context to make it unique, or use replace_all=true.")
+        old_content = content
         new_content = content.replace(old_string, new_string) if replace_all else \
                       content.replace(old_string, new_string, 1)
         p.write_text(new_content)
-        return f"Replaced {'all ' + str(count) if replace_all else '1'} occurrence(s) in {file_path}"
+        filename = p.name
+        diff = generate_unified_diff(old_content, new_content, filename)
+        return f"Changes applied to {filename}:\n\n{diff}"
     except Exception as e:
         return f"Error: {e}"
 

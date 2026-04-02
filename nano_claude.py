@@ -78,6 +78,25 @@ def warn(msg: str):   print(clr(f"Warning: {msg}", "yellow"))
 def err(msg: str):    print(clr(f"Error: {msg}", "red"), file=sys.stderr)
 
 
+def render_diff(text: str):
+    """Print diff text with ANSI colors: red for removals, green for additions."""
+    for line in text.splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            print(C["bold"] + line + C["reset"])
+        elif line.startswith("+"):
+            print(C["green"] + line + C["reset"])
+        elif line.startswith("-"):
+            print(C["red"] + line + C["reset"])
+        elif line.startswith("@@"):
+            print(C["cyan"] + line + C["reset"])
+        else:
+            print(line)
+
+def _has_diff(text: str) -> bool:
+    """Check if text contains a unified diff."""
+    return "--- a/" in text and "+++ b/" in text
+
+
 # ── Conversation rendering ─────────────────────────────────────────────────
 
 _accumulated_text: list[str] = []   # buffer text during streaming
@@ -118,6 +137,12 @@ def print_tool_end(name: str, result: str, verbose: bool):
     summary = f"→ {lines} lines ({size} chars)"
     if not result.startswith("Error") and not result.startswith("Denied"):
         print(clr(f"  ✓ {summary}", "dim", "green"), flush=True)
+        # Render diff for Edit/Write results
+        if name in ("Edit", "Write") and _has_diff(result):
+            parts = result.split("\n\n", 1)
+            if len(parts) == 2:
+                print(clr(f"  {parts[0]}", "dim"))
+                render_diff(parts[1])
     else:
         print(clr(f"  ✗ {result[:120]}", "dim", "red"), flush=True)
     if verbose and not result.startswith("Denied"):
