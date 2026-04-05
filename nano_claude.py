@@ -224,6 +224,29 @@ def ask_permission_interactive(desc: str, config: dict) -> bool:
 
 # ── Slash commands ─────────────────────────────────────────────────────────
 
+# ── Proactive Polling Globals ────────────────────────────────────────────────
+import time
+_proactive_enabled = False
+_proactive_interval = 300  # Default 5m = 300s
+_last_interaction_time = time.time()
+_proactive_thread = None
+
+def _proactive_watcher_loop(config):
+    global _last_interaction_time
+    while True:
+        time.sleep(1)
+        if not _proactive_enabled:
+            continue
+        try:
+            now = time.time()
+            if now - _last_interaction_time >= _proactive_interval:
+                _last_interaction_time = now
+                cb = config.get("_run_query_callback")
+                if cb:
+                    cb(f"(System Automated Event) You have been inactive for {_proactive_interval} seconds. Check if you have any pending tasks to execute or simply say 'No pending tasks'.")
+        except Exception:
+            pass
+
 def cmd_help(_args: str, _state, _config) -> bool:
     print(__doc__)
     return True
@@ -934,6 +957,41 @@ def cmd_tasks(args: str, _state, _config) -> bool:
 _voice_language: str = "auto"
 
 
+def cmd_proactive(args: str, state, config) -> bool:
+    """Toggle proactive background polling. Usage: /proactive [duration] (default 5m)"""
+    global _proactive_enabled, _proactive_interval, _last_interaction_time
+    
+    args = args.strip().lower()
+    
+    if _proactive_enabled and not args:
+        _proactive_enabled = False
+        info("Proactive background polling: OFF")
+        return True
+        
+    if args:
+        multiplier = 1
+        val_str = args
+        if args.endswith("m"):
+            multiplier = 60
+            val_str = args[:-1]
+        elif args.endswith("h"):
+            multiplier = 3600
+            val_str = args[:-1]
+        elif args.endswith("s"):
+            val_str = args[:-1]
+            
+        try:
+            val = int(val_str)
+            _proactive_interval = val * multiplier
+        except ValueError:
+            err(f"Invalid duration format: '{args}'. Use '5m', '30s', etc.")
+            return True
+            
+    _proactive_enabled = True
+    _last_interaction_time = time.time()
+    info(f"Proactive background polling: ON (Triggering every {_proactive_interval}s of inactivity)")
+    return True
+
 def cmd_voice(args: str, state, config) -> bool:
     """Voice input: record → STT → auto-submit as user message.
 
@@ -1053,6 +1111,7 @@ COMMANDS = {
     "plugin":      cmd_plugin,
     "tasks":       cmd_tasks,
     "task":        cmd_tasks,
+    "proactive":   cmd_proactive,
     "voice":       cmd_voice,
     "exit":        cmd_exit,
     "quit":        cmd_exit,
@@ -1138,8 +1197,15 @@ def repl(config: dict, initial_prompt: str = None):
 
     query_lock = threading.Lock()
     
+    global _proactive_thread, _last_interaction_time
+    if _proactive_thread is None:
+        _last_interaction_time = time.time()
+        _proactive_thread = threading.Thread(target=_proactive_watcher_loop, args=(config,), daemon=True)
+        _proactive_thread.start()
+    
     def run_query(user_input: str, is_background: bool = False):
         nonlocal verbose
+        global _last_interaction_time
         
         with query_lock:
             verbose = config.get("verbose", False)
@@ -1196,6 +1262,8 @@ def repl(config: dict, initial_prompt: str = None):
         # Drain any AskUserQuestion prompts raised during this turn
         from tools import drain_pending_questions
         drain_pending_questions()
+        
+        _last_interaction_time = time.time()
 
     config["_run_query_callback"] = lambda msg: run_query(msg, is_background=True)
 
