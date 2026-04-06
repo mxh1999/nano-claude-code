@@ -1856,6 +1856,206 @@ def cmd_worker(args: str, state, config) -> bool:
     return ("__worker__", worker_prompts)
 
 
+# ── Telegram bot ───────────────────────────────────────────────────────────
+
+_telegram_thread = None
+_telegram_stop = threading.Event()
+
+def _tg_api(token: str, method: str, params: dict = None):
+    """Call Telegram Bot API. Returns parsed JSON or None on error."""
+    import urllib.request, urllib.parse
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    if params:
+        data = json.dumps(params).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    else:
+        req = urllib.request.Request(url)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return None
+
+def _tg_send(token: str, chat_id: int, text: str):
+    """Send a message to a Telegram chat, splitting if too long."""
+    MAX = 4000  # Telegram limit is 4096, leave margin
+    chunks = [text[i:i+MAX] for i in range(0, len(text), MAX)]
+    for chunk in chunks:
+        _tg_api(token, "sendMessage", {"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"})
+
+def _tg_poll_loop(token: str, chat_id: int, config: dict):
+    """Long-polling loop that reads Telegram messages and feeds them to run_query."""
+    offset = 0
+    run_query_cb = config.get("_run_query_callback")
+    # Notify user bot is online
+    _tg_send(token, chat_id, "🟢 nano-claude is online.\nSend me a message and I'll process it.")
+
+    while not _telegram_stop.is_set():
+        try:
+            result = _tg_api(token, "getUpdates", {
+                "offset": offset,
+                "timeout": 30,
+                "allowed_updates": ["message"]
+            })
+            if not result or not result.get("ok"):
+                _telegram_stop.wait(5)
+                continue
+
+            for update in result.get("result", []):
+                offset = update["update_id"] + 1
+                msg = update.get("message", {})
+                msg_chat_id = msg.get("chat", {}).get("id")
+                text = msg.get("text", "")
+
+                if msg_chat_id != chat_id:
+                    _tg_api(token, "sendMessage", {
+                        "chat_id": msg_chat_id,
+                        "text": "⛔ Unauthorized."
+                    })
+                    continue
+
+                if not text:
+                    continue
+
+                # Handle Telegram bot commands (not for the model)
+                if text.strip().startswith("/"):
+                    tg_cmd = text.strip().lower()
+                    if tg_cmd in ("/stop", "/off"):
+                        _tg_send(token, chat_id, "🔴 Telegram bridge stopped.")
+                        _telegram_stop.set()
+                        break
+                    elif tg_cmd == "/start":
+                        _tg_send(token, chat_id, "🟢 nano-claude bridge is active. Send me anything.")
+                    else:
+                        _tg_send(token, chat_id, "Commands: /stop to disconnect")
+                    continue
+
+                # Show on local terminal
+                print(clr(f"\n  📩 Telegram: {text}", "cyan"))
+
+                # Run through nano's model
+                if run_query_cb:
+                    try:
+                        config["_telegram_incoming"] = True
+                        run_query_cb(text)
+                    except Exception as e:
+                        _tg_send(token, chat_id, f"⚠ Error: {e}")
+                        continue
+
+                # Grab the last assistant response from state
+                state = config.get("_state")
+                if state and state.messages:
+                    for m in reversed(state.messages):
+                        if m.get("role") == "assistant":
+                            content = m.get("content", "")
+                            if isinstance(content, list):
+                                # Extract text blocks from content array
+                                parts = []
+                                for block in content:
+                                    if isinstance(block, dict) and block.get("type") == "text":
+                                        parts.append(block["text"])
+                                    elif isinstance(block, str):
+                                        parts.append(block)
+                                content = "\n".join(parts)
+                            if content:
+                                _tg_send(token, chat_id, content)
+                            break
+        except Exception:
+            _telegram_stop.wait(5)
+
+    global _telegram_thread
+    _telegram_thread = None
+
+
+def cmd_telegram(args: str, _state, config) -> bool:
+    """Telegram bot bridge — receive and respond to messages via Telegram.
+
+    Usage: /telegram <bot_token> <chat_id>   — start the bridge
+           /telegram stop                    — stop the bridge
+           /telegram status                  — show current status
+
+    First time: create a bot via @BotFather, then send any message to your bot
+    and check https://api.telegram.org/bot<TOKEN>/getUpdates to find your chat_id.
+    Settings are saved so you only configure once.
+    """
+    global _telegram_thread, _telegram_stop
+    from config import save_config
+
+    parts = args.strip().split()
+
+    # /telegram stop
+    if parts and parts[0].lower() in ("stop", "off"):
+        if _telegram_thread and _telegram_thread.is_alive():
+            _telegram_stop.set()
+            _telegram_thread.join(timeout=5)
+            _telegram_thread = None
+            ok("Telegram bridge stopped.")
+        else:
+            warn("Telegram bridge is not running.")
+        return True
+
+    # /telegram status
+    if parts and parts[0].lower() == "status":
+        running = _telegram_thread and _telegram_thread.is_alive()
+        token = config.get("telegram_token", "")
+        chat_id = config.get("telegram_chat_id", "")
+        if running:
+            ok(f"Telegram bridge is running. Chat ID: {chat_id}")
+        elif token:
+            info(f"Configured but not running. Use /telegram to start.")
+        else:
+            info("Not configured. Use /telegram <bot_token> <chat_id>")
+        return True
+
+    # /telegram <token> <chat_id> — configure and start
+    if len(parts) >= 2:
+        token = parts[0]
+        try:
+            chat_id = int(parts[1])
+        except ValueError:
+            err("Chat ID must be a number. Send a message to your bot, then check getUpdates.")
+            return True
+        config["telegram_token"] = token
+        config["telegram_chat_id"] = chat_id
+        save_config(config)
+        ok("Telegram config saved.")
+    else:
+        # Try to use saved config
+        token = config.get("telegram_token", "")
+        chat_id = config.get("telegram_chat_id", 0)
+
+    if not token or not chat_id:
+        err("No config found. Usage: /telegram <bot_token> <chat_id>")
+        return True
+
+    # Already running?
+    if _telegram_thread and _telegram_thread.is_alive():
+        warn("Telegram bridge is already running. Use /telegram stop first.")
+        return True
+
+    # Verify token
+    me = _tg_api(token, "getMe")
+    if not me or not me.get("ok"):
+        err("Invalid bot token. Check your token from @BotFather.")
+        return True
+
+    bot_name = me["result"].get("username", "unknown")
+    ok(f"Connected to @{bot_name}. Starting bridge...")
+
+    # Store state reference so the poll loop can read responses
+    config["_state"] = _state
+
+    _telegram_stop = threading.Event()
+    _telegram_thread = threading.Thread(
+        target=_tg_poll_loop, args=(token, chat_id, config), daemon=True
+    )
+    _telegram_thread.start()
+    ok(f"Telegram bridge active. Chat ID: {chat_id}")
+    info("Send messages to your bot — they'll be processed here.")
+    info("Stop with /telegram stop or send /stop in Telegram.")
+    return True
+
+
 # ── Voice command ──────────────────────────────────────────────────────────
 
 # Per-session voice language setting (BCP-47 code or "auto")
@@ -2077,6 +2277,7 @@ COMMANDS = {
     "brainstorm":  cmd_brainstorm,
     "worker":      cmd_worker,
     "ssj":         cmd_ssj,
+    "telegram":    cmd_telegram,
     "exit":        cmd_exit,
     "quit":        cmd_exit,
     "resume":      cmd_resume
@@ -2147,6 +2348,7 @@ _CMD_META: dict[str, tuple[str, list[str]]] = {
     "brainstorm":  ("Multi-persona AI debate + auto tasks", []),
     "worker":      ("Auto-implement pending tasks",       []),
     "ssj":         ("SSJ Developer Mode — power menu",    []),
+    "telegram":    ("Telegram bot bridge",                ["stop", "status"]),
     "exit":        ("Exit nano-claude-code",              []),
     "quit":        ("Exit (alias for /exit)",             []),
     "resume":      ("Resume last session",                []),
@@ -2253,6 +2455,8 @@ def repl(config: dict, initial_prompt: str = None):
             active_flags.append("thinking")
         if config.get("_proactive_enabled"):
             active_flags.append("proactive")
+        if config.get("telegram_token") and config.get("telegram_chat_id"):
+            active_flags.append("telegram")
         if active_flags:
             flags_str = " · ".join(clr(f, "green") for f in active_flags)
             info(f"Active: {flags_str}")
@@ -2287,8 +2491,9 @@ def repl(config: dict, initial_prompt: str = None):
             # Rebuild system prompt each turn (picks up cwd changes, etc.)
             system_prompt = build_system_prompt()
             
-            if is_background:
+            if is_background and not config.get("_telegram_incoming"):
                 print(clr("\n\n[Background Event Triggered]", "yellow"))
+            config.pop("_telegram_incoming", None)
 
             print(clr("\n╭─ Claude ", "dim") + clr("●", "green") + clr(" ─────────────────────────", "dim"))
 
@@ -2419,6 +2624,21 @@ def repl(config: dict, initial_prompt: str = None):
         config["_last_interaction_time"] = time.time()
 
     config["_run_query_callback"] = lambda msg: run_query(msg, is_background=True)
+
+    # ── Auto-start Telegram bridge if configured ──────────────────────
+    if config.get("telegram_token") and config.get("telegram_chat_id"):
+        global _telegram_thread, _telegram_stop
+        if not (_telegram_thread and _telegram_thread.is_alive()):
+            _tg_token = config["telegram_token"]
+            _tg_chat = config["telegram_chat_id"]
+            me = _tg_api(_tg_token, "getMe")
+            if me and me.get("ok"):
+                config["_state"] = state
+                _telegram_stop = threading.Event()
+                _telegram_thread = threading.Thread(
+                    target=_tg_poll_loop, args=(_tg_token, _tg_chat, config), daemon=True
+                )
+                _telegram_thread.start()
 
     # ── Rapid Ctrl+C force-quit ─────────────────────────────────────────
     # 3 Ctrl+C presses within 2 seconds → immediate hard exit
