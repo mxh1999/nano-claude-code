@@ -2125,7 +2125,7 @@ def repl(config: dict, initial_prompt: str = None):
             
             # If this was a background task, we redraw the prompt for the user
             if is_background:
-                print(clr("\n[claude-code-local] ❯ ", "yellow"), end="", flush=True)
+                print(clr("\n[claude-code-local] » ", "yellow"), end="", flush=True)
 
         # Drain any AskUserQuestion prompts raised during this turn
         from tools import drain_pending_questions
@@ -2252,7 +2252,7 @@ def repl(config: dict, initial_prompt: str = None):
         _print_background_notifications()
         try:
             cwd_short = Path.cwd().name
-            prompt = clr(f"\n[{cwd_short}] ", "dim") + clr("❯ ", "cyan", "bold")
+            prompt = clr(f"\n[{cwd_short}] ", "dim") + clr("» ", "cyan", "bold")
             user_input = _read_input(prompt)
         except (EOFError, KeyboardInterrupt):
             print()
