@@ -591,10 +591,12 @@ INSTRUCTIONS:
     for p_name, p_data in personas.items():
         icon = p_data.get("icon", "🤖")
         info(f"{icon} {clr(p_data['role'], 'yellow')} is thinking...")
+        _start_tool_spinner()
 
         hist_text = "\n\n".join(brainstorm_history) if brainstorm_history else ""
         content = call_persona(p_name, p_data, hist_text)
 
+        _stop_tool_spinner()
         if content:
             brainstorm_history.append(content)
             full_log.append(f"## {icon} {p_data['role']}\n{content}")
@@ -1618,6 +1620,242 @@ def cmd_tasks(args: str, _state, _config) -> bool:
     return True
 
 
+# ── SSJ Developer Mode ─────────────────────────────────────────────────────
+
+def cmd_ssj(args: str, state, config) -> bool:
+    """SSJ Developer Mode — Interactive power menu for project workflows.
+
+    Usage: /ssj
+    """
+    _SSJ_MENU = (
+        clr("\n╭─ SSJ Developer Mode ", "dim") + clr("⚡", "yellow") + clr(" ─────────────────────────", "dim")
+        + "\n│"
+        + "\n│  " + clr(" 1.", "bold") + " 💡  Brainstorm — Multi-persona AI debate"
+        + "\n│  " + clr(" 2.", "bold") + " 📋  Show TODO — View todo_list.txt"
+        + "\n│  " + clr(" 3.", "bold") + " 👷  Worker — Auto-implement pending tasks"
+        + "\n│  " + clr(" 4.", "bold") + " 🧠  Debate — Expert debate on a file"
+        + "\n│  " + clr(" 5.", "bold") + " ✨  Propose — AI improvement for a file"
+        + "\n│  " + clr(" 6.", "bold") + " 🔎  Review — Quick file analysis"
+        + "\n│  " + clr(" 7.", "bold") + " 📘  Readme — Auto-generate README.md"
+        + "\n│  " + clr(" 8.", "bold") + " 💬  Commit — AI-suggested commit message"
+        + "\n│  " + clr(" 9.", "bold") + " 🧪  Scan — Analyze git diff"
+        + "\n│  " + clr("10.", "bold") + " 📝  Promote — Idea to tasks"
+        + "\n│  " + clr(" 0.", "bold") + " 🚪  Exit SSJ Mode"
+        + "\n│"
+        + "\n" + clr("╰──────────────────────────────────────────────", "dim")
+    )
+
+    from pathlib import Path
+
+    def _pick_file(prompt_text="  Select file #: ", exts=None):
+        """Show numbered file list and let user pick one."""
+        files = sorted([
+            f for f in Path(".").iterdir()
+            if f.is_file() and not f.name.startswith(".")
+            and (exts is None or f.suffix in exts)
+        ])
+        if not files:
+            err("No matching files found in current directory.")
+            return None
+        print(clr(f"\n  📂 Files in {Path.cwd().name}/", "cyan"))
+        for i, f in enumerate(files, 1):
+            print(f"  {i:3d}. {f.name}")
+        sel = input(clr(prompt_text, "cyan")).strip()
+        if sel.isdigit() and 1 <= int(sel) <= len(files):
+            return str(files[int(sel) - 1])
+        elif sel:  # typed a filename directly
+            return sel
+        err("Invalid selection.")
+        return None
+
+    print(_SSJ_MENU)
+
+    while True:
+        try:
+            choice = input(clr("\n  ⚡ SSJ » ", "yellow", "bold")).strip()
+        except (KeyboardInterrupt, EOFError):
+            break
+
+        if choice.startswith("/"):
+            # Pass slash commands through to nano — exit SSJ and let REPL handle it
+            return ("__ssj_passthrough__", choice)
+
+        if choice == "0" or choice.lower() in ("exit", "q"):
+            ok("Exiting SSJ Mode.")
+            break
+
+        elif choice == "1":
+            topic = input(clr("  Topic (Enter for general): ", "cyan")).strip()
+            return ("__ssj_cmd__", "brainstorm", topic)
+
+        elif choice == "2":
+            todo_path = Path("todo_list.txt")
+            if todo_path.exists():
+                content = todo_path.read_text(encoding="utf-8", errors="replace")
+                lines = content.splitlines()
+                task_lines = [(i, l) for i, l in enumerate(lines) if l.strip().startswith("- [")]
+                pending = sum(1 for _, l in task_lines if l.strip().startswith("- [ ]"))
+                done = sum(1 for _, l in task_lines if l.strip().startswith("- [x]"))
+                print(clr(f"\n  📋 TODO List ({done} done / {pending} pending):", "cyan"))
+                print(clr("  " + "─" * 46, "dim"))
+                for num, (_, ln) in enumerate(task_lines, 1):
+                    ln_s = ln.strip()
+                    if ln_s.startswith("- [x]"):
+                        label = ln_s[5:].strip()
+                        print(clr(f"  {num:3d}. ✓ {label}", "green"))
+                    elif ln_s.startswith("- [ ]"):
+                        label = ln_s[5:].strip()
+                        print(f"  {num:3d}. ○ {label}")
+                print(clr("  " + "─" * 46, "dim"))
+                print(clr("  Tip: use Worker (3) with task #s e.g. 1,4,6 to run specific tasks", "dim"))
+            else:
+                err("No todo_list.txt found. Run Brainstorm (1) first.")
+
+        elif choice == "3":
+            task_num = input(clr("  Task # (Enter for all, or e.g. 1,4,6): ", "cyan")).strip()
+            return ("__ssj_cmd__", "worker", task_num)
+
+        elif choice == "4":
+            filepath = _pick_file("  File to debate #: ")
+            if not filepath:
+                continue
+            return ("__ssj_query__", (
+                f"Act as two expert developers with opposing views debating improvements for the file: {filepath}. "
+                f"Read the file first. Expert A focuses on architecture and clean code. "
+                f"Expert B focuses on performance and pragmatism. "
+                f"Have them debate 3 rounds, then produce a final consensus with actionable changes."
+            ))
+
+        elif choice == "5":
+            filepath = _pick_file("  File to improve #: ")
+            if not filepath:
+                continue
+            return ("__ssj_query__", (
+                f"Read {filepath} and propose specific, concrete improvements. "
+                f"For each improvement: explain the problem, show the fix, and apply it with Edit if the user approves. "
+                f"Focus on bugs, performance, readability, and security. Be concise."
+            ))
+
+        elif choice == "6":
+            filepath = _pick_file("  File to review #: ")
+            if not filepath:
+                continue
+            return ("__ssj_query__", (
+                f"Read {filepath} and provide a thorough code review. "
+                f"Rate it 1-10 on: readability, maintainability, performance, security. "
+                f"List specific issues with line numbers. Do NOT modify the file, review only."
+            ))
+
+        elif choice == "7":
+            filepath = _pick_file("  Generate README for file #: ", exts={".py", ".js", ".ts", ".go", ".rs"})
+            if not filepath:
+                continue
+            return ("__ssj_query__", (
+                f"Read ONLY the file {filepath}. Based on that single file, generate a professional README.md. "
+                f"Include: project description, features, installation, usage with examples, "
+                f"and contributing guidelines. Use the Write tool to create README.md. "
+                f"Do NOT read other files unless the user explicitly asks."
+            ))
+
+        elif choice == "8":
+            return ("__ssj_query__", (
+                "Run 'git diff --cached' and 'git diff' using Bash, analyze ALL changes, "
+                "and suggest a concise, descriptive commit message following conventional commits format. "
+                "Show the suggested message and ask for confirmation before committing."
+            ))
+
+        elif choice == "9":
+            return ("__ssj_query__", (
+                "Run 'git status' and 'git diff' using Bash. Analyze the current state of the repository. "
+                "Summarize: what files changed, what was added/removed, potential issues in the changes, "
+                "and suggest next steps."
+            ))
+
+        elif choice == "10":
+            brainstorm_dir = Path("brainstorm_outputs")
+            if not brainstorm_dir.exists() or not list(brainstorm_dir.glob("*.md")):
+                err("No brainstorm outputs found. Run Brainstorm (1) first.")
+                continue
+            latest = sorted(brainstorm_dir.glob("*.md"))[-1]
+            return ("__ssj_query__", (
+                f"Read the brainstorm file {latest} and extract all actionable ideas. "
+                f"Convert each idea into a task with checkbox format (- [ ] task description). "
+                f"Write them to todo_list.txt using the Write tool. Prioritize by impact."
+            ))
+
+        else:
+            err("Invalid option. Pick 0-10.")
+
+    return True
+
+
+# ── Worker command ─────────────────────────────────────────────────────────
+
+def cmd_worker(args: str, state, config) -> bool:
+    """Auto-implement pending tasks from todo_list.txt one by one.
+
+    Usage: /worker          — work through all pending tasks
+           /worker <n>      — implement task number n only
+
+    The worker reads todo_list.txt, picks pending tasks (- [ ]),
+    implements them, and marks them as done (- [x]) in the file.
+    """
+    from pathlib import Path
+
+    todo_path = Path("todo_list.txt")
+    if not todo_path.exists():
+        err("No todo_list.txt found. Run /brainstorm first to generate one.")
+        return True
+
+    content = todo_path.read_text(encoding="utf-8", errors="replace")
+    lines = content.splitlines()
+    pending = [(i, ln) for i, ln in enumerate(lines) if ln.strip().startswith("- [ ]")]
+
+    if not pending:
+        ok("All tasks completed! No pending items in todo_list.txt.")
+        return True
+
+    # If specific task numbers are given (e.g. "3" or "1,4,6")
+    target = args.strip()
+    if target:
+        try:
+            nums = [int(x.strip()) for x in target.split(",") if x.strip()]
+            selected = []
+            for n in nums:
+                if 1 <= n <= len(pending):
+                    selected.append(pending[n - 1])
+                else:
+                    err(f"Task #{n} out of range (1-{len(pending)}).")
+                    return True
+            pending = selected
+        except ValueError:
+            err(f"Invalid task number(s). Use 1-{len(pending)} or e.g. 1,4,6")
+            return True
+
+    ok(f"Worker starting — {len(pending)} task(s) to implement")
+    info("Pending tasks:")
+    for n, (_, ln) in enumerate(pending, 1):
+        print(f"  {n}. {ln.strip()}")
+
+    worker_prompts = []
+    for line_idx, task_line in pending:
+        task_text = task_line.strip().replace("- [ ] ", "", 1)
+        prompt = (
+            f"You are the Worker. Your job is to implement this task:\n\n"
+            f"  {task_text}\n\n"
+            f"Instructions:\n"
+            f"1. Read the relevant files, understand the codebase.\n"
+            f"2. Implement the task — write code, edit files, run tests.\n"
+            f"3. When DONE, use the Edit tool to mark this exact line in todo_list.txt:\n"
+            f'   Change "- [ ] {task_text}" to "- [x] {task_text}"\n'
+            f"4. If you CANNOT complete it, leave it as - [ ] and explain why.\n"
+            f"5. Be concise. Act, don't explain."
+        )
+        worker_prompts.append((line_idx, task_text, prompt))
+
+    return ("__worker__", worker_prompts)
+
+
 # ── Voice command ──────────────────────────────────────────────────────────
 
 # Per-session voice language setting (BCP-47 code or "auto")
@@ -1837,6 +2075,8 @@ COMMANDS = {
     "voice":       cmd_voice,
     "image":       cmd_image,
     "brainstorm":  cmd_brainstorm,
+    "worker":      cmd_worker,
+    "ssj":         cmd_ssj,
     "exit":        cmd_exit,
     "quit":        cmd_exit,
     "resume":      cmd_resume
@@ -1856,7 +2096,7 @@ def handle_slash(line: str, state, config) -> Union[bool, tuple]:
     if handler:
         result = handler(args, state, config)
         # cmd_voice/cmd_image/cmd_brainstorm return sentinels to ask the REPL to run_query
-        if isinstance(result, tuple) and result[0] in ("__voice__", "__image__", "__brainstorm__"):
+        if isinstance(result, tuple) and result[0] in ("__voice__", "__image__", "__brainstorm__", "__worker__", "__ssj_cmd__", "__ssj_query__", "__ssj_passthrough__"):
             return result
         return True
 
@@ -1904,6 +2144,9 @@ _CMD_META: dict[str, tuple[str, list[str]]] = {
     "cloudsave":   ("Cloud-sync sessions to GitHub Gist", ["setup", "auto", "list", "load", "push"]),
     "voice":       ("Voice input (record → STT)",         ["lang", "status"]),
     "image":       ("Send clipboard image to model",      []),
+    "brainstorm":  ("Multi-persona AI debate + auto tasks", []),
+    "worker":      ("Auto-implement pending tasks",       []),
+    "ssj":         ("SSJ Developer Mode — power menu",    []),
     "exit":        ("Exit nano-claude-code",              []),
     "quit":        ("Exit (alias for /exit)",             []),
     "resume":      ("Resume last session",                []),
@@ -2138,6 +2381,10 @@ def repl(config: dict, initial_prompt: str = None):
                                 f"\n  [tokens: +{event.input_tokens} in / "
                                 f"+{event.output_tokens} out]", "dim"
                             ))
+            except KeyboardInterrupt:
+                _stop_tool_spinner()
+                flush_response()
+                raise  # propagate to REPL handler which calls _track_ctrl_c
             except Exception as e:
                 _stop_tool_spinner()
                 import urllib.error
@@ -2173,11 +2420,30 @@ def repl(config: dict, initial_prompt: str = None):
 
     config["_run_query_callback"] = lambda msg: run_query(msg, is_background=True)
 
+    # ── Rapid Ctrl+C force-quit ─────────────────────────────────────────
+    # 3 Ctrl+C presses within 2 seconds → immediate hard exit
+    # Uses the default SIGINT (raises KeyboardInterrupt) but wraps the
+    # main loop to track timing of consecutive interrupts.
+    _ctrl_c_times = []
+
+    def _track_ctrl_c():
+        """Call this on every KeyboardInterrupt. Returns True if force-quit triggered."""
+        now = time.time()
+        _ctrl_c_times.append(now)
+        # Keep only presses within the last 2 seconds
+        _ctrl_c_times[:] = [t for t in _ctrl_c_times if now - t <= 2.0]
+        if len(_ctrl_c_times) >= 3:
+            _stop_tool_spinner()
+            print(clr("\n\n  Force quit (3x Ctrl+C).", "red", "bold"))
+            os._exit(1)
+        return False
+
     # ── Main loop ──
     if initial_prompt:
         try:
             run_query(initial_prompt)
         except KeyboardInterrupt:
+            _track_ctrl_c()
             print()
         return
 
@@ -2308,23 +2574,58 @@ def repl(config: dict, initial_prompt: str = None):
             continue
 
         result = handle_slash(user_input, state, config)
-        if isinstance(result, tuple):
+        # ── Sentinel processing loop ──
+        # Processes sentinel tuples returned by commands. SSJ-originated
+        # sentinels loop back to the SSJ menu after completion.
+        while isinstance(result, tuple):
             # Voice sentinel: ("__voice__", transcribed_text)
             if result[0] == "__voice__":
                 _, voice_text = result
                 try:
                     run_query(voice_text)
                 except KeyboardInterrupt:
+                    _track_ctrl_c()
                     print(clr("\n  (interrupted)", "yellow"))
-                continue
+                break
             # Image sentinel: ("__image__", prompt_text)
             if result[0] == "__image__":
                 _, image_prompt = result
                 try:
                     run_query(image_prompt)
                 except KeyboardInterrupt:
+                    _track_ctrl_c()
                     print(clr("\n  (interrupted)", "yellow"))
+                break
+
+            # SSJ passthrough: user typed a /command inside SSJ menu
+            if result[0] == "__ssj_passthrough__":
+                _, slash_line = result
+                inner = handle_slash(slash_line, state, config)
+                if isinstance(inner, tuple):
+                    result = inner
+                    continue
+                break
+
+            # SSJ command sentinel: ("__ssj_cmd__", cmd_name, args)
+            # Delegate to the real command and re-process its returned sentinel
+            if result[0] == "__ssj_cmd__":
+                _, cmd_name, cmd_args = result
+                inner = handle_slash(f"/{cmd_name} {cmd_args}".strip(), state, config)
+                if isinstance(inner, tuple):
+                    # Tag so we know to loop back to SSJ after processing
+                    result = ("__ssj_wrap__", inner)
+                    continue
+                # Command handled directly, loop back to SSJ
+                result = handle_slash("/ssj", state, config)
                 continue
+
+            # Unwrap SSJ-wrapped sentinel and process the inner sentinel
+            if result[0] == "__ssj_wrap__":
+                result = result[1]
+                _from_ssj_flag = True
+            else:
+                _from_ssj_flag = result[0] == "__ssj_query__"
+
             # Brainstorm sentinel: ("__brainstorm__", synthesis_prompt, out_file)
             if result[0] == "__brainstorm__":
                 _, brain_prompt, brain_out_file = result
@@ -2332,10 +2633,49 @@ def repl(config: dict, initial_prompt: str = None):
                 try:
                     run_query(brain_prompt)
                     _save_synthesis(state, brain_out_file)
+                    print(clr("\n  ── Generating TODO List from Master Plan ──", "dim"))
+                    run_query(
+                        "Based on the Master Plan you just synthesized, generate a todo_list.txt file in the current directory. "
+                        "Format: one task per line, each starting with '- [ ] '. "
+                        "Order by priority. Include ALL actionable items from the plan. "
+                        "Use the Write tool to create the file. Do NOT explain, just write the file now."
+                    )
+                    info("TODO list saved to todo_list.txt. Edit it freely, then use /worker to start implementing.")
                 except KeyboardInterrupt:
+                    _track_ctrl_c()
                     print(clr("\n  (interrupted)", "yellow"))
+                if _from_ssj_flag:
+                    result = handle_slash("/ssj", state, config)
+                    continue
+                break
+            # Worker sentinel: ("__worker__", [(line_idx, task_text, prompt), ...])
+            if result[0] == "__worker__":
+                _, worker_tasks = result
+                for i, (line_idx, task_text, prompt) in enumerate(worker_tasks):
+                    print(clr(f"\n  ── Worker ({i+1}/{len(worker_tasks)}): {task_text} ──", "yellow"))
+                    try:
+                        run_query(prompt)
+                    except KeyboardInterrupt:
+                        _track_ctrl_c()
+                        print(clr("\n  (worker interrupted — remaining tasks skipped)", "yellow"))
+                        break
+                ok("Worker finished. Run /worker to check remaining tasks.")
+                if _from_ssj_flag:
+                    result = handle_slash("/ssj", state, config)
+                    continue
+                break
+            # SSJ query sentinel: ("__ssj_query__", prompt)
+            if result[0] == "__ssj_query__":
+                _, ssj_prompt = result
+                try:
+                    run_query(ssj_prompt)
+                except KeyboardInterrupt:
+                    _track_ctrl_c()
+                    print(clr("\n  (interrupted)", "yellow"))
+                # Loop back to SSJ menu
+                result = handle_slash("/ssj", state, config)
                 continue
-            # Skill match: (SkillDef, args_str)
+            # Skill match (fallback): (SkillDef, args_str)
             skill, skill_args = result
             info(f"Running skill: {skill.name}" + (f" [{skill.context}]" if skill.context == "fork" else ""))
             try:
@@ -2343,14 +2683,17 @@ def repl(config: dict, initial_prompt: str = None):
                 rendered = substitute_arguments(skill.prompt, skill_args, skill.arguments)
                 run_query(f"[Skill: {skill.name}]\n\n{rendered}")
             except KeyboardInterrupt:
+                _track_ctrl_c()
                 print(clr("\n  (interrupted)", "yellow"))
-            continue
+            break
+        # Sentinel or command was handled — don't fall through to run_query
         if result:
             continue
 
         try:
             run_query(user_input)
         except KeyboardInterrupt:
+            _track_ctrl_c()
             print(clr("\n  (interrupted)", "yellow"))
             # Keep conversation history up to the interruption
 
