@@ -30,11 +30,12 @@ English | [中文](https://github.com/SafeRL-Lab/nano-claude-code/blob/main/docs
 
 ## 🔥🔥🔥 News (Pacific Time)
 
-- 10:04 PM, Apr 05, 2026 (**v3.05.5**): **Interactive Ollama Model Picker, Windows fixes, /brainstorm command**
-  - **Interactive Ollama Model Picker** — when a request fails with 404 (model not found), nano-claude now queries the local Ollama API (`/api/tags`) and presents a numbered model selector so you can switch to an available model and retry without restarting. Cancelling the picker aborts gracefully without crashing the REPL, and fix rich output issue.
-  - **Windows file handling** — `_read`, `_write`, and `_edit` in `tools.py` now force UTF-8 encoding and `newline=""` to prevent encoding failures with accented characters and double-CRLF on Windows. `_edit` detects pure-CRLF files (all `\n` are part of `\r\n`) and restores their line endings after edit; mixed-line-ending files are left as-is to avoid corruption.
-  - **/brainstorm command** — `/brainstorm [topic]` runs a multi-persona AI debate with 5 specialized agents (Architect, Innovator, Security, Code Quality, Performance). Results are saved to `brainstorm_outputs/` and synthesized by the main agent.
-  - **`threading.RLock`** — replaced `threading.Lock` with `RLock` in the REPL loop to support re-entrant calls from brainstorm synthesis and Ollama retry paths.
+- Apr 05, 2026 (**v3.05.5**): **Interactive Ollama Model Picker, Windows fixes, /brainstorm command, Rich Live SSH fix**
+  - **Interactive Ollama Model Picker** — when a request fails with 404 (model not found), nano-claude queries the local Ollama API (`/api/tags`) and presents a numbered model selector to switch models and retry without restarting. Cancelling aborts gracefully without crashing the REPL.
+  - **Windows file handling** — `_read`, `_write`, and `_edit` in `tools.py` now force UTF-8 encoding and `newline=""`. `_edit` detects pure-CRLF files (every `\n` is part of `\r\n`) and restores line endings after edit; mixed-line-ending files are left as-is to avoid corruption.
+  - **/brainstorm command** — `/brainstorm [topic]` runs a multi-persona AI debate. The model first generates N expert personas tailored to the topic (geopolitics → analysts & diplomats; software → architects & engineers; etc.). Agent count is chosen interactively at runtime (2–100, default 5). Results are saved to `brainstorm_outputs/` and synthesized by the main agent.
+  - **Rich Live SSH fix** — Rich's in-place Live streaming is now automatically disabled in SSH sessions (`SSH_CLIENT`/`SSH_TTY` detected) where ANSI cursor-up breaks and causes repeated output lines. Override with `/config rich_live=true/false`.
+  - **`threading.RLock`** — replaced `threading.Lock` with `RLock` to support re-entrant calls from brainstorm synthesis and Ollama retry paths.
 
 - 05:39 PM, Apr 05, 2026 (**v3.05.4**): **Reasoning, Rendering, and Packaging Improvements, Enhanced Memory System, Native vision support for local Ollama models, Bracketed Paste Mode, Rich Tab Completion**
   - **Bracketed Paste Mode** — replaced the old timing-based multi-line paste detection with the standard terminal Bracketed Paste Mode protocol. Pasted text of any length (code blocks, long prompts, multi-paragraph instructions) is now collected as a single turn with zero latency and no blank-line artifacts. Falls back to a 60 ms timing window for terminals that don't support BPM. Bracketed paste mode is cleanly disabled on REPL exit.
@@ -204,10 +205,10 @@ Claude Code is a powerful, production-grade AI coding assistant — but its sour
 | Permission system | `auto` / `accept-all` / `manual` modes |
 | 19 slash commands | `/model` · `/config` · `/save` · `/cost` · `/memory` · `/skills` · `/agents` · `/voice` · `/proactive` · … |
 | Voice input | Record → transcribe → auto-submit. Backends: `sounddevice` / `arecord` / SoX + `faster-whisper` / `openai-whisper` / OpenAI API. Works fully offline. |
-| Brainstorm | `/brainstorm [topic]` dynamically generates 5 expert personas suited to the topic (software, geopolitics, business, etc.), runs an iterative debate, saves results to `brainstorm_outputs/`, and synthesizes a Master Plan. |
+| Brainstorm | `/brainstorm [topic]` generates N expert personas suited to the topic (2–100, default 5, chosen interactively), runs an iterative debate, saves results to `brainstorm_outputs/`, and synthesizes a Master Plan. |
 | Vision input | `/image [prompt]` captures the clipboard image and sends it to a local vision model (Ollama `llava`, `gemma4`, `llama3.2-vision`). Requires `pip install nano-claude-code[vision]`; Linux also needs `xclip`. |
 | Proactive monitoring | `/proactive [duration]` starts a background sentinel daemon; agent wakes automatically after inactivity, enabling continuous monitoring loops without user prompts |
-| Rich Live streaming | When `rich` is installed, responses render as live-updating Markdown in place — no duplicate raw text, clean tool-call interleaving |
+| Rich Live streaming | When `rich` is installed, responses render as live-updating Markdown in place. Auto-disabled in SSH sessions to prevent repeated output; override with `/config rich_live=false`. |
 | Context injection | Auto-loads `CLAUDE.md`, git status, cwd, persistent memory |
 | Session persistence | Autosave on exit to `daily/YYYY-MM-DD/` (per-day limit) + `history.json` (master, all sessions) + `session_latest.json` (/resume); sessions include `session_id` and `saved_at` metadata; `/load` grouped by date |
 | Cloud sync | `/cloudsave` syncs sessions to private GitHub Gists; auto-sync on exit; load from cloud by Gist ID. No new dependencies (stdlib `urllib`). |
@@ -1423,10 +1424,11 @@ These are passed as Whisper's `initial_prompt` so the STT engine prefers correct
 ### How it works
 
 1. **Context snapshot** — reads `README.md`, `CLAUDE.md`, and root file listing from the current working directory.
-2. **Dynamic persona generation** — the model first generates 5 expert roles tailored to your topic. For a software architecture topic you get engineers and architects; for geopolitics you get analysts, diplomats, and economists; for a business question you get strategists and market experts. Falls back to default tech personas if generation fails.
-3. **Five agents debate sequentially**, each building on the previous responses.
-4. **Output saved** to `brainstorm_outputs/brainstorm_YYYYMMDD_HHMMSS.md` in the current directory.
-5. **Synthesis** — the main agent reads the saved file and produces a prioritized Master Plan.
+2. **Agent count** — you are prompted to choose how many agents (2–100, default 5). Press Enter to use the default.
+3. **Dynamic persona generation** — the model generates N expert roles tailored to your topic. Software topics get architects and engineers; geopolitics gets analysts, diplomats, and economists; business gets strategists and market experts. Falls back to built-in tech personas if generation fails.
+4. **Agents debate sequentially**, each building on the previous responses.
+5. **Output saved** to `brainstorm_outputs/brainstorm_YYYYMMDD_HHMMSS.md` in the current directory.
+6. **Synthesis** — the main agent reads the saved file and produces a prioritized Master Plan.
 
 **Example personas by topic:**
 
@@ -1440,31 +1442,30 @@ These are passed as Whisper's `initial_prompt` so the STT engine prefers correct
 
 ```
 [myproject] ❯ /brainstorm
-  How many agents? (2-10, default 5) > 5
+  How many agents? (2-100, default 5) > 5
 
 [myproject] ❯ /brainstorm improve plugin architecture
-  How many agents? (2-10, default 5) > 3
+  How many agents? (2-100, default 5) > 3
 
 [myproject] ❯ /brainstorm US-Iran geopolitics
-  How many agents? (2-10, default 5) > 7
+  How many agents? (2-100, default 5) > 7
 ```
 
 ### Example output
 
 ```
-✓  Starting Multi-Agent Brainstorming Session on: improve plugin architecture
-   Generating diverse architectural perspectives...
-🏗️  Principal Software Architect is thinking...
-   └─ Perspective captured.
-💡  Pragmatic Product Innovator is thinking...
-   └─ Perspective captured.
-🛡️  Security & Risk Engineer is thinking...
-   └─ Perspective captured.
-🔧  Senior Code Quality Lead is thinking...
-   └─ Perspective captured.
-⚡  Performance & Optimization Specialist is thinking...
-   └─ Perspective captured.
-✓  Brainstorming complete! Results saved to brainstorm_outputs/brainstorm_20260405_211428.md
+[myproject] ❯ /brainstorm medical research funding
+  How many agents? (2-100, default 5) > 3
+Generating 3 topic-appropriate expert personas...
+Starting 3-Agent Brainstorming Session on: medical research funding
+Generating diverse perspectives...
+🩺 Clinical Trials Director is thinking...
+  └─ Perspective captured.
+⚖️ Medical Ethics Committee Member is thinking...
+  └─ Perspective captured.
+💰 Health Economics Policy Analyst is thinking...
+  └─ Perspective captured.
+✓  Brainstorming complete! Results saved to brainstorm_outputs/brainstorm_20260405_224117.md
 
    ── Analysis from Main Agent ──
 [synthesized Master Plan streams here…]
@@ -1473,8 +1474,10 @@ These are passed as Whisper's `initial_prompt` so the STT engine prefers correct
 ### Notes
 
 - Brainstorm uses the **currently selected model** (`/model` to check). A capable model (Claude Sonnet/Opus, GPT-4o, or a large local model) gives the best results.
+- With many agents (20+) the session can take several minutes depending on model speed.
 - Install `faker` (`pip install faker`) for randomized persona names; falls back to built-in names otherwise.
-- Output files accumulate in `brainstorm_outputs/` — add it to `.gitignore` if you don't want them committed (already added by v3.05.5).
+- Output files accumulate in `brainstorm_outputs/` — already added to `.gitignore` by v3.05.5.
+- If output looks garbled in SSH (repeated lines), run `/config rich_live=false` to disable Rich Live streaming.
 
 ---
 
