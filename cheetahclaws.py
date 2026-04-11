@@ -118,6 +118,11 @@ def ok(msg: str):     print(clr(msg, "green"))
 def warn(msg: str):   print(clr(f"Warning: {msg}", "yellow"))
 def err(msg: str):    print(clr(f"Error: {msg}", "red"), file=sys.stderr)
 
+def _truncate_err_global(s: str, max_len: int = 200) -> str:
+    if len(s) <= max_len:
+        return s
+    return s[:max_len - 3] + "..."
+
 
 # ── Load feature modules from modular/ ecosystem ──────────────────────────────
 # Commands from modular/ are merged into COMMANDS after the dict is built.
@@ -3513,21 +3518,38 @@ def repl(config: dict, initial_prompt: str = None):
                 raise  # propagate to REPL handler which calls _track_ctrl_c
             except Exception as e:
                 _stop_tool_spinner()
+                flush_response()
                 import urllib.error
                 # Catch 404 Not Found (Ollama model missing)
                 if isinstance(e, urllib.error.HTTPError) and e.code == 404:
                     from providers import detect_provider
                     if detect_provider(config["model"]) == "ollama":
-                        flush_response()
                         err(f"Ollama model '{config['model']}' not found.")
                         if _interactive_ollama_picker(config):
-                            # Remove the user message added by run() before retrying
                             if state.messages and state.messages[-1]["role"] == "user":
                                 state.messages.pop()
                             return run_query(user_input, is_background)
-                        # User cancelled picker — abort gracefully without crashing
                         return
-                raise e
+                # Context too long — force compact and retry
+                err_str = str(e).lower()
+                is_context_err = any(s in err_str for s in [
+                    "context_length", "context window", "too many tokens",
+                    "input is too long", "prompt is too long", "token limit",
+                ])
+                if is_context_err:
+                    warn("Context too long — forcing compaction and retrying...")
+                    from compaction import estimate_tokens, get_context_limit
+                    from agent import _force_compact
+                    _force_compact(state, config)
+                    after = estimate_tokens(state.messages)
+                    limit = get_context_limit(config.get("model", ""))
+                    if after < limit * 0.9:
+                        return run_query(user_input, is_background)
+                    err(f"Context still too large after compaction ({after} / {limit} tokens). Try /compact or start a new session.")
+                    return
+                # Any other uncaught error — never crash, just report and let user retry
+                err(f"Error: {type(e).__name__}: {_truncate_err_global(str(e))}")
+                warn("Your conversation is intact. You can retry or type a new message.")
 
             _stop_tool_spinner()
             flush_response()  # stop Live, commit any remaining text

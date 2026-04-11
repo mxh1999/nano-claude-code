@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Generator
@@ -10,7 +11,7 @@ from tool_registry import get_tool_schemas
 from tools import execute_tool
 import tools as _tools_init  # ensure built-in tools are registered on import
 from providers import stream, AssistantTurn, TextChunk, ThinkingChunk, detect_provider
-from compaction import maybe_compact
+from compaction import maybe_compact, estimate_tokens, get_context_limit, compact_messages
 
 # ── Re-export event types (used by cheetahclaws.py) ────────────────────────
 __all__ = [
@@ -90,18 +91,50 @@ def run(
         # Compact context if approaching window limit
         maybe_compact(state, config)
 
-        # Stream from provider (auto-detected from model name)
-        for event in stream(
-            model=config["model"],
-            system=system_prompt,
-            messages=state.messages,
-            tool_schemas=get_tool_schemas(),
-            config=config,
-        ):
-            if isinstance(event, (TextChunk, ThinkingChunk)):
-                yield event
-            elif isinstance(event, AssistantTurn):
-                assistant_turn = event
+        # Stream from provider — retry on ANY error (never crash the session)
+        max_retries = 3
+        for attempt in range(max_retries + 1):
+            try:
+                for event in stream(
+                    model=config["model"],
+                    system=system_prompt,
+                    messages=state.messages,
+                    tool_schemas=get_tool_schemas(),
+                    config=config,
+                ):
+                    if isinstance(event, (TextChunk, ThinkingChunk)):
+                        yield event
+                    elif isinstance(event, AssistantTurn):
+                        assistant_turn = event
+                break  # success — exit retry loop
+            except Exception as e:
+                if attempt >= max_retries:
+                    yield TextChunk(f"\n[Failed after {max_retries} retries — {_truncate_err(str(e))}. Please retry manually.]\n")
+                    break  # give up gracefully instead of crashing
+
+                err_str = str(e).lower()
+                err_type = type(e).__name__
+
+                is_context_too_long = any(s in err_str for s in [
+                    "context_length", "context window", "too many tokens",
+                    "input is too long", "prompt is too long",
+                    "request too large", "token limit",
+                ])
+                is_overloaded = "overloaded" in err_str or "overloaded_error" in err_type
+                is_rate_limit = "rate_limit" in err_str or e.__class__.__name__ == "RateLimitError"
+
+                if is_context_too_long:
+                    _force_compact(state, config)
+                    yield TextChunk(f"\n[Context too long — compacted and retrying (attempt {attempt+1}/{max_retries})]\n")
+                    continue
+
+                # All other errors: backoff + retry (overloaded gets longer backoff)
+                if is_overloaded or is_rate_limit:
+                    backoff = min(30, 2 ** (attempt + 2))  # 4s, 8s, 16s
+                else:
+                    backoff = 2 ** (attempt + 1)  # 2s, 4s, 8s
+                yield TextChunk(f"\n[Retry {attempt+1}/{max_retries} after {backoff}s — {err_type}: {_truncate_err(str(e))}]\n")
+                time.sleep(backoff)
 
         if assistant_turn is None:
             break
@@ -211,3 +244,24 @@ def _permission_desc(tc: dict) -> str:
     if name == "Write":  return f"Write to: {inp.get('file_path', '')}"
     if name == "Edit":   return f"Edit: {inp.get('file_path', '')}"
     return f"{name}({list(inp.values())[:1]})"
+
+
+def _force_compact(state: AgentState, config: dict) -> bool:
+    """Force compaction regardless of threshold. Used when API rejects for context too long."""
+    limit = get_context_limit(config.get("model", ""))
+    before = estimate_tokens(state.messages)
+    if before <= 0:
+        return False
+    from compaction import snip_old_tool_results
+    snip_old_tool_results(state.messages, max_chars=1000, preserve_last_n_turns=3)
+    if estimate_tokens(state.messages) < limit * 0.9:
+        return True
+    state.messages = compact_messages(state.messages, config)
+    after = estimate_tokens(state.messages)
+    return after < before
+
+
+def _truncate_err(s: str, max_len: int = 120) -> str:
+    if len(s) <= max_len:
+        return s
+    return s[:max_len - 3] + "..."

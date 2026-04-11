@@ -7,7 +7,14 @@ import providers
 # ── Token estimation ──────────────────────────────────────────────────────
 
 def estimate_tokens(messages: list) -> int:
-    """Estimate token count by summing content lengths / 3.5.
+    """Estimate token count. Uses chars/2.8 (conservative for code-heavy content).
+
+    The old chars/3.5 divisor underestimated real token counts for code-heavy
+    conversations because: (1) code tokens are ~2.5-3 chars each, not 3.5,
+    (2) tool schemas, JSON keys, and special chars take more tokens than plain
+    text, (3) per-message framing overhead (~4 tokens/msg) is not counted.
+    This caused compaction to skip when it should have triggered, leading to
+    context overflow crashes.
 
     Args:
         messages: list of message dicts with "content" field (str or list of dicts)
@@ -15,24 +22,27 @@ def estimate_tokens(messages: list) -> int:
         approximate token count, int
     """
     total_chars = 0
+    msg_count = 0
     for m in messages:
+        msg_count += 1
         content = m.get("content", "")
         if isinstance(content, str):
             total_chars += len(content)
         elif isinstance(content, list):
             for block in content:
                 if isinstance(block, dict):
-                    # Sum all string values in the block
                     for v in block.values():
                         if isinstance(v, str):
                             total_chars += len(v)
-        # Also count tool_calls if present
         for tc in m.get("tool_calls", []):
             if isinstance(tc, dict):
                 for v in tc.values():
                     if isinstance(v, str):
                         total_chars += len(v)
-    return int(total_chars / 3.5)
+    # chars/2.8 for content + 4 tokens/msg framing overhead + 10% buffer
+    content_tokens = int(total_chars / 2.8)
+    framing_tokens = msg_count * 4
+    return int((content_tokens + framing_tokens) * 1.1)
 
 
 def get_context_limit(model: str) -> int:
