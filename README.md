@@ -677,7 +677,9 @@ CUDA_VISIBLE_DEVICES=7 python -m vllm.entrypoints.openai.api_server \
 # Example: vLLM serving Qwen2.5-Coder-32B
 python -m vllm.entrypoints.openai.api_server \
     --model Qwen/Qwen2.5-Coder-32B-Instruct \
-    --port 8000
+    --port 8000 \
+    --enable-auto-tool-choice \                                                                                                                                                   
+    --tool-call-parser hermes 
 
 # Then run cheetahclaws pointing to your server:
 cheetahclaws
