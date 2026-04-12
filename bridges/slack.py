@@ -13,13 +13,20 @@ from __future__ import annotations
 
 import json
 import threading
+import time as _time_mod
 
 from ui.render import clr, info, ok, warn, err
 import runtime
 import logging_utils as _log
+import jobs as _jobs
 
 _slack_thread: threading.Thread | None = None
 _slack_stop   = threading.Event()
+
+# ── Per-bridge job queue ───────────────────────────────────────────────────
+_sl_queue: list[tuple[str, str, str, str]] = []  # [(job_id, prompt, token, channel)]
+_sl_queue_lock = threading.Lock()
+_sl_busy = threading.Event()
 
 _SLACK_API_BASE      = "https://slack.com/api"
 _SLACK_POLL_INTERVAL = 2
@@ -301,90 +308,213 @@ def _slack_poll_loop(token: str, channel: str, config: dict) -> str:
                                      daemon=True).start()
                     continue
 
-                # ── Claude query: stream response live into placeholder ────
-                def _slack_bg_runner(q_text, ch):
-                    import time as _time
+                # ── Job dashboard & control commands ───────────────────────
+                stripped_lower = text.strip().lower()
+                if stripped_lower in ("!jobs", "!j", "!status"):
+                    _slack_send(token, channel, _jobs.format_dashboard())
+                    continue
 
-                    think_resp = _slack_post(token, "chat.postMessage", {
-                        "channel": ch, "text": "⏳ Thinking…"
-                    })
-                    think_ts = (think_resp or {}).get("ts") if think_resp and think_resp.get("ok") else None
+                if stripped_lower.startswith("!job "):
+                    jid = text.strip().split(None, 1)[1].lstrip("#").strip()
+                    _slack_send(token, channel, _jobs.format_detail(jid))
+                    continue
 
-                    _chunks: list[str] = []
-                    _last_edit = [0.0]
-                    _stream_lock = threading.Lock()
+                if stripped_lower.startswith("!retry "):
+                    jid = text.strip().split(None, 1)[1].lstrip("#").strip()
+                    original = _jobs.get(jid)
+                    if not original:
+                        _slack_send(token, channel, f"❓ Job #{jid} not found.")
+                        continue
+                    retry_job = _jobs.create(original.prompt, source="slack",
+                                             retry_of=original.id)
+                    _slack_send(token, channel,
+                                f"↩ Retrying #{jid} as #{retry_job.id}:\n\"{original.title}\"")
+                    _dispatch_sl_job(retry_job, original.prompt, token, channel,
+                                     run_query_cb, session_ctx, config)
+                    continue
 
-                    def _update_placeholder():
-                        text_so_far = "".join(_chunks)
-                        if not text_so_far or not think_ts:
-                            return
-                        _slack_post(token, "chat.update", {
-                            "channel": ch, "ts": think_ts,
-                            "text": text_so_far[-3000:],
-                        })
-                        _last_edit[0] = _time.monotonic()
+                if stripped_lower in ("!cancel", "!kill"):
+                    running = _jobs.list_running()
+                    if running:
+                        for j in running:
+                            _jobs.cancel(j.id)
+                        _slack_send(token, channel, f"🚫 Cancelled {len(running)} job(s).")
+                    else:
+                        _slack_send(token, channel, "ℹ No running jobs to cancel.")
+                    continue
 
-                    def _on_chunk(chunk: str):
-                        _chunks.append(chunk)
-                        with _stream_lock:
-                            if _time.monotonic() - _last_edit[0] >= 1.2:
-                                _update_placeholder()
+                if stripped_lower.startswith(("!cancel ", "!kill ")):
+                    jid = text.strip().split(None, 1)[1].lstrip("#").strip()
+                    j = _jobs.get(jid)
+                    if j:
+                        _jobs.cancel(jid)
+                        _slack_send(token, channel, f"🚫 Job #{jid} cancelled.")
+                    else:
+                        _slack_send(token, channel, f"❓ Job #{jid} not found.")
+                    continue
 
-                    def _on_tool_start(name: str, inputs: dict):
-                        cmd_preview = str(inputs.get("command", inputs.get("file_path", ""))).strip()[:60]
-                        label = f"🔧 *{name}*" + (f": `{cmd_preview}`" if cmd_preview else "")
-                        _slack_send(token, ch, label)
+                # ── Wizard / interactive input pending ────────────────────
+                _pending_evt = getattr(session_ctx, "slack_input_event", None)
+                if _pending_evt is not None:
+                    session_ctx.slack_input_value = text
+                    _pending_evt.set()
+                    continue
 
-                    session_ctx.on_text_chunk = _on_chunk
-                    session_ctx.on_tool_start = _on_tool_start
-                    session_ctx.on_tool_end   = None
+                # ── Claude query: create job, queue if busy, else run now ──
+                job = _jobs.create(text, source="slack")
 
-                    config["_slack_current_channel"] = ch
-                    config["_in_slack_turn"] = True
-                    try:
-                        if run_query_cb:
-                            run_query_cb(q_text)
-                    except Exception as e:
-                        _slack_send(token, ch, f"⚠ Error: {e}")
-                        return
-                    finally:
-                        session_ctx.on_text_chunk = None
-                        session_ctx.on_tool_start = None
-                        config.pop("_in_slack_turn", None)
-                        config.pop("_slack_current_channel", None)
+                if _sl_busy.is_set():
+                    with _sl_queue_lock:
+                        _sl_queue.append((job.id, text, token, channel))
+                    queue_pos = len(_sl_queue)
+                    _slack_send(token, channel,
+                                f"⏳ Queued as job #{job.id} (position {queue_pos})\n"
+                                f"\"{job.title}\"\n"
+                                f"Use `!jobs` to check status.")
+                    continue
 
-                    _update_placeholder()
-                    # If nothing streamed, fall back to reading state
-                    if not _chunks:
-                        state = session_ctx.agent_state
-                        if state and state.messages:
-                            for m in reversed(state.messages):
-                                if m.get("role") == "assistant":
-                                    content = m.get("content", "")
-                                    if isinstance(content, list):
-                                        content = "\n".join(
-                                            b.get("text", "") if isinstance(b, dict) and b.get("type") == "text"
-                                            else (b if isinstance(b, str) else "")
-                                            for b in content
-                                        )
-                                    if content:
-                                        if think_ts:
-                                            _slack_post(token, "chat.update", {
-                                                "channel": ch, "ts": think_ts, "text": content
-                                            })
-                                        else:
-                                            _slack_send(token, ch, content)
-                                    break
-                    elif _chunks:
-                        print(clr(f"  ✈  Slack streamed → {"".join(_chunks)[:60]}…", "cyan"))
-
-                threading.Thread(target=_slack_bg_runner, args=(text, channel), daemon=True).start()
+                _dispatch_sl_job(job, text, token, channel,
+                                 run_query_cb, session_ctx, config)
 
         except Exception:
             _slack_stop.wait(5)
 
     session_ctx.slack_send = None
     return "stopped"
+
+
+# ── Job dispatch & background runner ──────────────────────────────────────
+
+def _dispatch_sl_job(job, q_text: str, token: str, channel: str,
+                     run_query_cb, session_ctx, config: dict) -> None:
+    def _run():
+        _sl_busy.set()
+        try:
+            _sl_bg_runner(job, q_text, token, channel, run_query_cb, session_ctx, config)
+        finally:
+            _sl_busy.clear()
+            _drain_sl_queue(run_query_cb, session_ctx, config)
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _drain_sl_queue(run_query_cb, session_ctx, config: dict) -> None:
+    with _sl_queue_lock:
+        if not _sl_queue:
+            return
+        job_id, prompt, token, channel = _sl_queue.pop(0)
+
+    job = _jobs.get(job_id)
+    if not job or job.status == "cancelled":
+        _drain_sl_queue(run_query_cb, session_ctx, config)
+        return
+
+    remaining = len(_sl_queue)
+    pos_msg = f" ({remaining} more in queue)" if remaining else ""
+    _slack_send(token, channel,
+                f"▶ Starting job #{job_id}{pos_msg}:\n\"{job.title}\"")
+    _dispatch_sl_job(job, prompt, token, channel, run_query_cb, session_ctx, config)
+
+
+def _sl_bg_runner(job, q_text: str, token: str, channel: str,
+                  run_query_cb, session_ctx, config: dict) -> None:
+    """Execute one Slack AI query with full job tracking + live streaming."""
+
+    _jobs.start(job.id)
+
+    think_resp = _slack_post(token, "chat.postMessage", {
+        "channel": channel,
+        "text": f"⏳ Job #{job.id} running…",
+    })
+    think_ts = (think_resp or {}).get("ts") if think_resp and think_resp.get("ok") else None
+
+    _chunks: list[str] = []
+    _last_edit = [0.0]
+    _stream_lock = threading.Lock()
+
+    def _update_placeholder():
+        text_so_far = "".join(_chunks)
+        if not text_so_far or not think_ts:
+            return
+        _slack_post(token, "chat.update", {
+            "channel": channel, "ts": think_ts,
+            "text": text_so_far[-3000:],
+        })
+        _last_edit[0] = _time_mod.monotonic()
+
+    def _on_chunk(chunk: str):
+        _chunks.append(chunk)
+        _jobs.stream_result(job.id, chunk)
+        with _stream_lock:
+            if _time_mod.monotonic() - _last_edit[0] >= 1.2:
+                _update_placeholder()
+
+    def _on_tool_start(name: str, inputs: dict):
+        preview = str(inputs.get("command",
+                      inputs.get("file_path",
+                      inputs.get("pattern",
+                      inputs.get("query", ""))))).strip()[:60]
+        _jobs.add_step(job.id, name, preview)
+        label = f"🔧 *{name}*" + (f": `{preview}`" if preview else "")
+        _slack_send(token, channel, label)
+
+    def _on_tool_end(name: str, result: str):
+        _jobs.finish_step(job.id, name, result[:80] if result else "")
+
+    session_ctx.on_text_chunk = _on_chunk
+    session_ctx.on_tool_start = _on_tool_start
+    session_ctx.on_tool_end   = _on_tool_end
+
+    config["_slack_current_channel"] = channel
+    config["_in_slack_turn"] = True
+    try:
+        if run_query_cb:
+            run_query_cb(q_text)
+    except Exception as e:
+        _jobs.fail(job.id, str(e))
+        _slack_send(token, channel,
+                    f"❌ Job #{job.id} failed: {e}\n↩ Retry with: `!retry {job.id}`")
+        return
+    finally:
+        session_ctx.on_text_chunk = None
+        session_ctx.on_tool_start = None
+        session_ctx.on_tool_end   = None
+        config.pop("_in_slack_turn", None)
+        config.pop("_slack_current_channel", None)
+
+    _update_placeholder()
+
+    final_text = "".join(_chunks).strip()
+    if not final_text:
+        state = session_ctx.agent_state
+        if state and state.messages:
+            for m in reversed(state.messages):
+                if m.get("role") == "assistant":
+                    content = m.get("content", "")
+                    if isinstance(content, list):
+                        content = "\n".join(
+                            b.get("text", "") if isinstance(b, dict) and b.get("type") == "text"
+                            else (b if isinstance(b, str) else "")
+                            for b in content
+                        )
+                    if content:
+                        if think_ts:
+                            _slack_post(token, "chat.update", {
+                                "channel": channel, "ts": think_ts, "text": content
+                            })
+                        else:
+                            _slack_send(token, channel, content)
+                        final_text = content
+                    break
+
+    _jobs.complete(job.id, final_text)
+
+    j = _jobs.get(job.id)
+    if j and j.step_count > 0:
+        dur = f"  {j.duration_s:.0f}s" if j.duration_s else ""
+        _slack_send(token, channel,
+                    f"✅ Job #{job.id} done ({j.step_count} steps{dur})")
+
+    print(clr(f"  ✅  Slack job #{job.id} done", "green"))
 
 
 _SLACK_BACKOFF_INITIAL = 2.0

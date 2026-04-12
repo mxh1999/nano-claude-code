@@ -10,13 +10,21 @@ from __future__ import annotations
 
 import json
 import threading
+import time as _time_mod
 
 from ui.render import clr, info, ok, warn, err
 import runtime
 import logging_utils as _log
+import jobs as _jobs
 
 _telegram_thread: threading.Thread | None = None
 _telegram_stop = threading.Event()
+
+# ── Per-bridge job queue ───────────────────────────────────────────────────
+# When the AI is processing a query, new messages are queued rather than dropped.
+_tg_queue: list[tuple[str, str, int]] = []   # [(prompt, token, chat_id), ...]
+_tg_queue_lock = threading.Lock()
+_tg_busy = threading.Event()   # set while a query is running
 
 
 # ── HTTP helpers ───────────────────────────────────────────────────────────
@@ -330,6 +338,52 @@ def _tg_poll_loop(token: str, chat_id: int, config: dict) -> str:
 
                 print(clr(f"\n  📩 Telegram: {text}", "cyan"))
 
+                # ── Job dashboard & control commands ───────────────────────
+                stripped_lower = text.strip().lower()
+                if stripped_lower in ("!jobs", "!j", "!status"):
+                    _tg_send(token, chat_id, _jobs.format_dashboard())
+                    continue
+
+                if stripped_lower.startswith("!job "):
+                    jid = text.strip().split(None, 1)[1].lstrip("#").strip()
+                    _tg_send(token, chat_id, _jobs.format_detail(jid))
+                    continue
+
+                if stripped_lower.startswith("!retry "):
+                    jid = text.strip().split(None, 1)[1].lstrip("#").strip()
+                    original = _jobs.get(jid)
+                    if not original:
+                        _tg_send(token, chat_id, f"❓ Job #{jid} not found.")
+                        continue
+                    retry_job = _jobs.create(original.prompt, source="telegram",
+                                             retry_of=original.id)
+                    _tg_send(token, chat_id,
+                             f"↩ Retrying #{jid} as #{retry_job.id}:\n\"{original.title}\"")
+                    _dispatch_tg_job(retry_job, original.prompt, token, chat_id,
+                                     run_query_cb, session_ctx, config)
+                    continue
+
+                if stripped_lower in ("!cancel", "!kill"):
+                    running = _jobs.list_running()
+                    if running:
+                        for j in running:
+                            _jobs.cancel(j.id)
+                        _tg_send(token, chat_id,
+                                 f"🚫 Cancelled {len(running)} job(s).")
+                    else:
+                        _tg_send(token, chat_id, "ℹ No running jobs to cancel.")
+                    continue
+
+                if stripped_lower.startswith("!cancel ") or stripped_lower.startswith("!kill "):
+                    jid = text.strip().split(None, 1)[1].lstrip("#").strip()
+                    j = _jobs.get(jid)
+                    if j:
+                        _jobs.cancel(jid)
+                        _tg_send(token, chat_id, f"🚫 Job #{jid} cancelled.")
+                    else:
+                        _tg_send(token, chat_id, f"❓ Job #{jid} not found.")
+                    continue
+
                 # ── !command: run shell command and stream output ──────────
                 if text.strip().startswith("!"):
                     raw_cmd = text.strip()[1:].strip()
@@ -352,87 +406,174 @@ def _tg_poll_loop(token: str, chat_id: int, config: dict) -> str:
                                      daemon=True).start()
                     continue
 
-                # ── Claude query: stream response back live ────────────────
-                def _bg_runner(q_text, chat_token, chat_id):
-                    import time as _time
+                # ── Wizard / interactive input pending ────────────────────
+                # If a /monitor or other interactive command is waiting for
+                # user input, route this message to it instead of the AI.
+                _pending_evt = getattr(session_ctx, "tg_input_event", None)
+                if _pending_evt is not None:
+                    session_ctx.tg_input_value = text
+                    _pending_evt.set()
+                    continue
 
-                    # Post placeholder; we'll edit it as chunks arrive
-                    init_resp = _tg_api(chat_token, "sendMessage", {
-                        "chat_id": chat_id, "text": "⏳",
-                    })
-                    msg_id = (
-                        (init_resp or {}).get("result", {}).get("message_id")
-                        if init_resp and init_resp.get("ok") else None
-                    )
+                # ── Claude query: create job, queue if busy, else run now ──
+                job = _jobs.create(text, source="telegram")
 
-                    # Streaming state
-                    _chunks: list[str] = []
-                    _last_edit = [0.0]
-                    _stream_lock = threading.Lock()
+                if _tg_busy.is_set():
+                    with _tg_queue_lock:
+                        _tg_queue.append((job.id, text, token, chat_id))
+                    queue_pos = len(_tg_queue)
+                    _tg_send(token, chat_id,
+                             f"⏳ Queued as job #{job.id} (position {queue_pos})\n"
+                             f"\"{job.title}\"\n"
+                             f"Use !jobs to check status.")
+                    continue
 
-                    def _edit_msg():
-                        text_so_far = "".join(_chunks)
-                        if not text_so_far or not msg_id:
-                            return
-                        # Telegram max message length: 4096 chars
-                        _tg_api(chat_token, "editMessageText", {
-                            "chat_id": chat_id,
-                            "message_id": msg_id,
-                            "text": text_so_far[-4000:],
-                        })
-                        _last_edit[0] = _time.monotonic()
-
-                    def _on_chunk(chunk: str):
-                        _chunks.append(chunk)
-                        with _stream_lock:
-                            if _time.monotonic() - _last_edit[0] >= 1.2:  # Telegram: ≤1 edit/sec
-                                _edit_msg()
-
-                    def _on_tool_start(name: str, inputs: dict):
-                        cmd_preview = str(inputs.get("command", inputs.get("file_path", ""))).strip()[:60]
-                        label = f"🔧 {name}" + (f": `{cmd_preview}`" if cmd_preview else "")
-                        _tg_send(chat_token, chat_id, label)
-
-                    session_ctx.on_text_chunk  = _on_chunk
-                    session_ctx.on_tool_start  = _on_tool_start
-                    session_ctx.on_tool_end    = None
-
-                    try:
-                        config["_telegram_incoming"] = True
-                        run_query_cb(q_text)
-                    except Exception as e:
-                        _tg_send(chat_token, chat_id, f"⚠ Error: {e}")
-                        return
-                    finally:
-                        session_ctx.on_text_chunk = None
-                        session_ctx.on_tool_start = None
-                        config.pop("_telegram_incoming", None)
-
-                    # Final edit to ensure the complete response is shown
-                    _edit_msg()
-                    # If nothing was streamed (pure tool-use turn), send final assistant msg
-                    if not _chunks:
-                        state = session_ctx.agent_state
-                        if state and state.messages:
-                            for m in reversed(state.messages):
-                                if m.get("role") == "assistant":
-                                    content = m.get("content", "")
-                                    if isinstance(content, list):
-                                        content = "\n".join(
-                                            b.get("text", "") if isinstance(b, dict) and b.get("type") == "text"
-                                            else (b if isinstance(b, str) else "")
-                                            for b in content
-                                        )
-                                    if content:
-                                        _tg_send(chat_token, chat_id, content)
-                                    break
-
-                threading.Thread(target=_bg_runner, args=(text, token, chat_id), daemon=True).start()
+                _dispatch_tg_job(job, text, token, chat_id,
+                                 run_query_cb, session_ctx, config)
 
         except Exception:
             _telegram_stop.wait(5)
 
     return "stopped"
+
+
+# ── Job dispatch & background runner ──────────────────────────────────────
+
+def _dispatch_tg_job(job, q_text: str, token: str, chat_id: int,
+                     run_query_cb, session_ctx, config: dict) -> None:
+    """Fire job in a background thread, then drain the queue."""
+    def _run():
+        _tg_busy.set()
+        try:
+            _bg_runner(job, q_text, token, chat_id, run_query_cb, session_ctx, config)
+        finally:
+            _tg_busy.clear()
+            _drain_tg_queue(run_query_cb, session_ctx, config)
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _drain_tg_queue(run_query_cb, session_ctx, config: dict) -> None:
+    """Run the next queued job, if any."""
+    with _tg_queue_lock:
+        if not _tg_queue:
+            return
+        job_id, prompt, token, chat_id = _tg_queue.pop(0)
+
+    job = _jobs.get(job_id)
+    if not job or job.status == "cancelled":
+        # Skip cancelled jobs, try next
+        _drain_tg_queue(run_query_cb, session_ctx, config)
+        return
+
+    remaining = len(_tg_queue)
+    pos_msg = f" ({remaining} more in queue)" if remaining else ""
+    _tg_send(token, chat_id,
+             f"▶ Starting job #{job_id}{pos_msg}:\n\"{job.title}\"")
+    _dispatch_tg_job(job, prompt, token, chat_id, run_query_cb, session_ctx, config)
+
+
+def _bg_runner(job, q_text: str, chat_token: str, chat_id: int,
+               run_query_cb, session_ctx, config: dict) -> None:
+    """Execute one AI query with full job tracking + live streaming."""
+
+    _jobs.start(job.id)
+
+    # Post placeholder message; we'll edit it live as chunks arrive
+    init_resp = _tg_api(chat_token, "sendMessage", {
+        "chat_id": chat_id,
+        "text": f"⏳ Job #{job.id} running…",
+    })
+    msg_id = (
+        (init_resp or {}).get("result", {}).get("message_id")
+        if init_resp and init_resp.get("ok") else None
+    )
+
+    _chunks: list[str] = []
+    _last_edit = [0.0]
+    _stream_lock = threading.Lock()
+    _step_lines: list[str] = []     # running list of tool invocations for progress view
+
+    def _edit_msg(force: bool = False):
+        text_so_far = "".join(_chunks)
+        if not text_so_far or not msg_id:
+            return
+        _tg_api(chat_token, "editMessageText", {
+            "chat_id": chat_id,
+            "message_id": msg_id,
+            "text": text_so_far[-4000:],
+        })
+        _last_edit[0] = _time_mod.monotonic()
+
+    def _on_chunk(chunk: str):
+        _chunks.append(chunk)
+        _jobs.stream_result(job.id, chunk)
+        with _stream_lock:
+            if _time_mod.monotonic() - _last_edit[0] >= 1.2:
+                _edit_msg()
+
+    def _on_tool_start(name: str, inputs: dict):
+        preview = str(inputs.get("command",
+                      inputs.get("file_path",
+                      inputs.get("pattern",
+                      inputs.get("query", ""))))).strip()[:60]
+        _jobs.add_step(job.id, name, preview)
+        step_label = f"🔧 {name}" + (f": `{preview}`" if preview else "")
+        _step_lines.append(step_label)
+        # Send compact progress message (not one per tool, batched)
+        if len(_step_lines) == 1 or len(_step_lines) % 3 == 0:
+            _tg_send(chat_token, chat_id, step_label)
+
+    def _on_tool_end(name: str, result: str):
+        _jobs.finish_step(job.id, name, result[:80] if result else "")
+
+    session_ctx.on_text_chunk = _on_chunk
+    session_ctx.on_tool_start = _on_tool_start
+    session_ctx.on_tool_end   = _on_tool_end   # ← now wired!
+
+    try:
+        config["_telegram_incoming"] = True
+        run_query_cb(q_text)
+    except Exception as e:
+        _jobs.fail(job.id, str(e))
+        _tg_send(chat_token, chat_id,
+                 f"❌ Job #{job.id} failed: {e}\n↩ Retry with: !retry {job.id}")
+        return
+    finally:
+        session_ctx.on_text_chunk = None
+        session_ctx.on_tool_start = None
+        session_ctx.on_tool_end   = None
+        config.pop("_telegram_incoming", None)
+
+    # Finalize
+    _edit_msg(force=True)
+
+    final_text = "".join(_chunks).strip()
+    if not final_text:
+        # Pure tool-use turn: grab last assistant message
+        state = session_ctx.agent_state
+        if state and state.messages:
+            for m in reversed(state.messages):
+                if m.get("role") == "assistant":
+                    content = m.get("content", "")
+                    if isinstance(content, list):
+                        content = "\n".join(
+                            b.get("text", "") if isinstance(b, dict) and b.get("type") == "text"
+                            else (b if isinstance(b, str) else "")
+                            for b in content
+                        )
+                    if content:
+                        final_text = content
+                        _tg_send(chat_token, chat_id, content)
+                    break
+
+    _jobs.complete(job.id, final_text)
+
+    # Send completion summary
+    j = _jobs.get(job.id)
+    if j and j.step_count > 0:
+        dur = f"  {j.duration_s:.0f}s" if j.duration_s else ""
+        _tg_send(chat_token, chat_id,
+                 f"✅ Job #{job.id} done ({j.step_count} steps{dur})")
 
 
 # ── Supervisor (auto-reconnect) ────────────────────────────────────────────

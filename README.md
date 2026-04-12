@@ -91,6 +91,22 @@ English | [中文](https://github.com/SafeRL-Lab/clawspring/blob/main/docs/READM
 ## 🔥🔥🔥 News (Pacific Time)
 
  
+- Apr 12, 2026 (**v3.05.65**): **`/agent` SSJ entry, bridge-compatible wizard, and `/monitor` interactive wizard fix**
+  - **SSJ entry 14 — 🤖 Agent** (`commands/advanced.py`) — The SSJ power menu now has a 14th option that launches the `/agent` interactive wizard directly, covering all four autonomous templates (Research Assistant, Auto Bug Fixer, Paper Writer, Auto Coder).
+  - **Bridge-compatible agent wizard** (`commands/agent_cmd.py`) — The wizard's input helper `_ask()` now routes through `ask_input_interactive()` so it works correctly over Telegram, Slack, and WeChat bridges (previously used bare `input()` which is terminal-only).
+  - **`/monitor` interactive wizard input fix** (all three bridges) — When the `/monitor` wizard sends a menu to a bridge and waits for user input, the next message from the user was incorrectly treated as a new AI query. Each bridge's poll loop now checks `session_ctx.tg/slack/wx_input_event` before dispatching to the AI — wizard replies are correctly routed back to the waiting prompt.
+  - **Version bumped to 3.05.65.**
+
+- Apr 12, 2026 (**v3.05.64**): **`/monitor` — AI subscription system & `/agent` task template system**
+  - **`/monitor` wizard** — typing `/monitor` with no arguments launches an interactive setup wizard: live subscription list, numbered menu (add subscription / run now / start-stop scheduler / remove / configure notifications), zero memorization required. Works in terminal and all three bridges.
+  - **`monitor/` package** — `fetchers.py` (arxiv RSS + weekend API fallback · Yahoo Finance · CoinGecko · Reuters/BBC/AP RSS · DuckDuckGo), `summarizer.py` (AI summarization via `providers.stream()`), `notifier.py` (Telegram / Slack / console delivery), `scheduler.py` (background daemon, `daily` / `6h` / `30m` schedules), `store.py` (persistent subscriptions at `~/.cheetahclaws/monitor_subscriptions.json`).
+  - **`/subscribe <topic> [schedule] [--telegram] [--slack]`** — subscribe to `ai_research`, `stock_TSLA`, `crypto_BTC`, `world_news`, or `custom:<query>`. Schedule defaults to `daily`; delivery defaults to configured channels.
+  - **`/agent` wizard** — `/agent` with no args launches the autonomous agent wizard (Research Assistant / Auto Bug Fixer / Paper Writer / Auto Coder / Custom); walks through template-specific questions, confirms, then starts the loop in a background thread.
+  - **`agent_runner.py`** — isolated `AgentState` per runner, calls `agent.run()` per iteration, auto-approves permissions, pushes iteration summaries via active bridge, persists to `~/.cheetahclaws/agents/<name>/log.jsonl`.
+  - **4 built-in agent templates** (`agent_templates/`): `research_assistant`, `auto_bug_fixer`, `paper_writer`, `auto_coder` — Markdown-driven program.md style (inspired by Karpathy's autoresearch).
+  - **Job queue & remote control** (all three bridges) — persistent job registry (`jobs.py`, `~/.cheetahclaws/jobs.json`); new bridge commands: `!jobs` / `!j` (dashboard), `!job <id>` (detail), `!retry <id>` (re-run failed job), `!cancel [id]` (stop job); per-bridge queue (FIFO when AI is busy); `on_tool_start` / `on_tool_end` hooks wired in all three bridges for live step tracking.
+  - **Version bumped to 3.05.64.**
+
 - Apr 12, 2026 (**v3.05.63**): **Phone bridge: PTY permission prompt now responds correctly to digit inputs**
   - **Ink SelectInput fix** (`bridges/interactive_session.py`) — Claude Code's permission prompts (e.g. "❯ 1. Yes  2. Yes, don't ask again  3. No") are rendered by Ink's `SelectInput` which only responds to arrow-key + Enter events, not digit key presses. Sending `2` from the phone previously had no effect (or misrouted to the wrong option) because the raw digit was written verbatim to the PTY.
   - **Automatic arrow-key translation** — `send_input()` now detects when the pyte screen shows a numbered `❯ 1.` menu and maps the digit to the correct ANSI escape sequence: `1` → Enter (cursor already on item 1), `2` → `↓` + Enter, `3` → `↓↓` + Enter, and so on up to `9`. The translation fires only when the screen shows the menu pattern and the input is a single digit; all other inputs are forwarded unchanged.
@@ -161,6 +177,9 @@ CheetahClaws: **A Lightweight** and **Easy-to-Use** Python Reimplementation of C
   * [Telegram Bridge](#telegram-bridge)
   * [WeChat Bridge](#wechat-bridge)
   * [Slack Bridge](#slack-bridge)
+  * [Remote Control (Phone → Computer)](#remote-control-phone--computer)
+  * [Monitor — AI Subscriptions & Alerts](#monitor--ai-subscriptions--alerts)
+  * [Autonomous Agents](#autonomous-agents)
   * [Video Content Factory](#video-content-factory)
   * [TTS Content Factory](#tts-content-factory)
   * [Tmux Integration](#tmux-integration)
@@ -349,7 +368,10 @@ Claude Code is a powerful, production-grade AI coding assistant — but its sour
 | 36 slash commands | `/model` · `/config` · `/save` · `/cost` · `/memory` · `/skills` · `/agents` · `/voice` · `/proactive` · `/checkpoint` · `/plan` · `/compact` · `/status` · `/doctor` · … |
 | Voice input | Record → transcribe → auto-submit. Backends: `sounddevice` / `arecord` / SoX + `faster-whisper` / `openai-whisper` / OpenAI API. Works fully offline. |
 | Brainstorm | `/brainstorm [topic]` generates N expert personas suited to the topic (2–100, default 5, chosen interactively), runs an iterative debate, saves results to `brainstorm_outputs/`, and synthesizes a Master Plan + auto-generates `brainstorm_outputs/todo_list.txt`. |
-| SSJ Developer Mode | `/ssj` opens a persistent interactive power menu with up to 12 shortcuts: Brainstorm, TODO viewer, Worker, Expert Debate, Propose, Review, Readme, Commit, Scan, Promote, Video factory (if available), TTS factory (if available). Stays open between actions; `/command` passthrough supported. |
+| SSJ Developer Mode | `/ssj` opens a persistent interactive power menu with **14 shortcuts**: Brainstorm, TODO viewer, Worker, Expert Debate, Propose, Review, Readme, Commit, Scan, Promote, Video factory, TTS factory, Monitor, Agent. Stays open between actions; `/command` passthrough supported. |
+| Monitor | `/monitor` (no args → wizard) subscribes to AI-monitored topics on a schedule and pushes reports to Telegram/Slack/console. Topics: `ai_research` (arxiv), `stock_<TICKER>`, `crypto_<SYMBOL>`, `world_news` (Reuters/BBC/AP), `custom:<query>`. Schedules: 15m to weekly. Background scheduler daemon with `/monitor start/stop/status`. |
+| Autonomous Agents | `/agent` (no args → wizard) launches autonomous background agent loops driven by Markdown task templates. 4 built-in templates: `research_assistant`, `auto_bug_fixer`, `paper_writer`, `auto_coder`. Iteration summaries pushed via bridge. Custom templates: drop a `.md` file into `~/.cheetahclaws/agent_templates/`. |
+| Remote Control job queue | All three bridges (Telegram/Slack/WeChat) maintain a per-bridge FIFO job queue when the AI is busy. `!jobs` / `!j` — dashboard; `!job <id>` — detail; `!retry <id>` — re-run a failed job; `!cancel [id]` — stop current job. Tool step tracking with `on_tool_start`/`on_tool_end` hooks. Persistent log at `~/.cheetahclaws/jobs.json`. |
 | Worker | `/worker [task#s]` reads `brainstorm_outputs/todo_list.txt`, implements each pending task with a dedicated model prompt, and marks it done (`- [x]`). Supports task selection (`/worker 1,4,6`), custom path (`--path`), and worker count limit (`--workers`). Detects and redirects accidental brainstorm `.md` paths. |
 | Telegram bridge | `/telegram <token> <chat_id>` starts a bot bridge: receive messages from Telegram, run the model, and reply — all from your phone. Typing indicator, slash command passthrough (including interactive menus), and auto-start on launch if configured. |
 | WeChat bridge | `/wechat login` authenticates via QR code scan (same as WeixinClawBot / openclaw-weixin plugin), then starts the iLink long-poll bridge. `context_token` echoed per peer, typing indicator, slash command passthrough, session expiry auto-recovery. Credentials saved for auto-start on next launch. |
@@ -878,7 +900,25 @@ Type `/` and press **Tab** to see all commands with descriptions. Continue typin
 | `/cloudsave load <gist_id>` | Download and restore a session from Gist |
 | `/brainstorm` | Run a multi-persona AI brainstorm; prompts for agent count (2–100, default 5) |
 | `/brainstorm <topic>` | Focus the brainstorm on a specific topic; prompts for agent count |
-| `/ssj` | Open SSJ Developer Mode — interactive power menu with 10 workflow shortcuts |
+| `/ssj` | Open SSJ Developer Mode — interactive power menu with 14 workflow shortcuts |
+| `/monitor` | Interactive wizard: add subscriptions, run now, start/stop scheduler, configure notifications |
+| `/monitor run [topic]` | Run all (or one) subscription(s) immediately and print the AI report |
+| `/monitor start` | Start the background scheduler daemon |
+| `/monitor stop` | Stop the background scheduler daemon |
+| `/monitor status` | Show scheduler status, subscriptions, and configured delivery channels |
+| `/monitor set telegram <token> <chat_id>` | Configure Telegram delivery for monitor reports |
+| `/monitor set slack <token> <channel_id>` | Configure Slack delivery for monitor reports |
+| `/monitor topics` | List all built-in topics |
+| `/subscribe <topic> [schedule] [--telegram] [--slack]` | Subscribe to a monitoring topic (e.g. `ai_research`, `stock_TSLA`, `crypto_BTC`, `world_news`, `custom:quantum computing`) |
+| `/subscriptions` | List active subscriptions with schedule and last-run time |
+| `/subs` | Alias for `/subscriptions` |
+| `/unsubscribe <topic>` | Remove a subscription |
+| `/agent` | Interactive wizard: choose template, answer questions, start background agent loop |
+| `/agent start <template> [args]` | Direct launch — e.g. `/agent start research_assistant ~/papers/` |
+| `/agent stop <name\|all>` | Stop a running agent (or all agents) |
+| `/agent list` | Show all currently running agents and their status |
+| `/agent status <name>` | Show recent iteration log for a named agent |
+| `/agent templates` | List available templates (built-in + user-defined) |
 | `/worker` | Auto-implement all pending tasks from `brainstorm_outputs/todo_list.txt` |
 | `/worker <n,m,…>` | Implement specific pending tasks by number (e.g. `/worker 1,4,6`) |
 | `/worker --path <file>` | Use a custom todo file path instead of the default |
@@ -1779,6 +1819,8 @@ Generating diverse perspectives...
 | 10 | 📝 Promote | Read the latest brainstorm output → convert ideas to `todo_list.txt` tasks |
 | 11 | 🎬 Video | Launch the Video Content Factory wizard (if `modular/video` is available) |
 | 12 | 🎙 TTS | Launch the TTS Content Factory wizard (if `modular/voice` is available) |
+| 13 | 📡 Monitor | Launch the AI Monitor wizard — add subscriptions, run now, configure push notifications |
+| 14 | 🤖 Agent | Launch the Autonomous Agent wizard — Research Assistant / Auto Bug Fixer / Paper Writer / Auto Coder / Custom |
 | 0 | 🚪 Exit | Return to the main REPL |
 
 ### Usage
@@ -1800,6 +1842,8 @@ Generating diverse perspectives...
 │  10.  📝  Promote    — Idea to tasks
 │  11.  🎬  Video      — Video Content Factory
 │  12.  🎙  TTS        — TTS Content Factory
+│  13.  📡  Monitor    — AI subscriptions & alerts
+│  14.  🤖  Agent      — Autonomous task agents
 │   0.  🚪  Exit SSJ Mode
 │
 ╰──────────────────────────────────────────────
@@ -1968,8 +2012,9 @@ Phone (Telegram)                  cheetahclaws terminal
 
 - **Typing indicator** is sent every 4 seconds while the model processes, so the chat feels responsive.
 - **Unauthorized senders** receive `⛔ Unauthorized.` and their messages are dropped.
-- **Slash command passthrough**: send `/cost`, `/model gpt-4o`, `/clear`, etc. from Telegram and they execute in cheetahclaws.
-- **Interactive menus over Telegram**: commands with interactive prompts (e.g. `/ollama` model picker, `/permission`, `/checkpoint` restore) now run in a background thread so the poll loop stays free. The menu options are sent as a Telegram message and the next reply you send is used as the selection.
+- **Slash command passthrough**: send `/cost`, `/model gpt-4o`, `/clear`, `/monitor`, `/agent`, etc. from Telegram and they execute in cheetahclaws.
+- **Interactive menus over Telegram**: commands with interactive prompts (e.g. `/monitor` wizard, `/agent` wizard, `/permission`, `/checkpoint`) run in a background thread. The menu is sent as a Telegram message; your next reply is used as the selection.
+- **Job queue & remote control**: `!jobs` / `!job <id>` / `!retry <id>` / `!cancel` — see [Remote Control](#remote-control-phone--computer).
 - **`/stop` or `/off`** sent from Telegram stops the bridge gracefully.
 
 ### Photo & Voice support
@@ -2079,10 +2124,11 @@ The bridge long-polls `POST /ilink/bot/getupdates` (35-second window) in a daemo
 - **QR code authentication** — scan once; credentials are saved for future launches. Expired sessions (`errcode -14`) clear saved credentials and the next `/wechat` re-triggers the QR flow automatically.
 - **Typing indicator** — sent every 4 seconds while the model processes, so the chat feels responsive.
 - **context_token echo** — per-peer `context_token` is cached in memory and echoed on every reply (iLink protocol requirement).
-- **Slash command passthrough** — send `/cost`, `/model gpt-4o`, `/clear`, etc. from WeChat and they execute in cheetahclaws. The result is sent back to the same WeChat conversation.
-- **Interactive menu routing** — commands with interactive prompts (e.g. `/permission`, `/checkpoint` restore) run in a background thread and route the prompt to WeChat; your next WeChat reply is used as the selection input.
+- **Slash command passthrough** — send `/cost`, `/model gpt-4o`, `/clear`, `/monitor`, `/agent`, etc. from WeChat and they execute in cheetahclaws. The result is sent back to the same WeChat conversation.
+- **Interactive menu routing** — commands with interactive prompts (e.g. `/monitor` wizard, `/agent` wizard, `/permission`, `/checkpoint`) run in a background thread and route the prompt to WeChat; your next WeChat reply is used as the selection input.
+- **Per-user job queue** — each WeChat user has an independent job queue; `!任务` / `!job <id>` / `!retry <id>` / `!cancel` for remote control. See [Remote Control](#remote-control-phone--computer).
 - **`/stop` or `/off`** sent from WeChat stops the bridge gracefully.
-- **Multi-user support** — each sender's `user_id` is tracked separately so `context_token` and input routing stay per-peer.
+- **Multi-user support** — each sender's `user_id` is tracked separately so `context_token`, job queue, and input routing stay per-peer.
 - **Message deduplication** — `message_id` / `seq` dedup prevents double-processing on reconnect.
 
 ### Commands
@@ -2160,8 +2206,9 @@ Every 2 seconds, cheetahclaws polls `GET conversations.history?oldest=<last_ts>`
 
 - **No external packages** — uses only Python's stdlib `urllib`; no `slack_sdk` or `requests` needed.
 - **In-place reply update** — "⏳ Thinking…" placeholder is replaced with the actual response, keeping the channel tidy.
-- **Slash command passthrough** — send `/cost`, `/model gpt-4o`, `/clear`, etc. from Slack and they execute in cheetahclaws; results are sent back to the same channel.
-- **Interactive menu routing** — permission prompts and interactive menus route to Slack; your next message is used as the selection input.
+- **Slash command passthrough** — send `/cost`, `/model gpt-4o`, `/clear`, `/monitor`, `/agent`, etc. from Slack and they execute in cheetahclaws; results are sent back to the same channel.
+- **Interactive menu routing** — `/monitor` wizard, `/agent` wizard, permission prompts, and other interactive menus route to Slack; your next message is used as the selection input.
+- **Job queue & remote control**: `!jobs` / `!job <id>` / `!retry <id>` / `!cancel` — see [Remote Control](#remote-control-phone--computer).
 - **Auth validation on start** — `auth.test` is called before the poll loop; invalid tokens surface a clear error immediately.
 - **`/stop` or `/off`** sent from Slack stops the bridge gracefully.
 - **Message deduplication** — `ts` (Slack timestamp) dedup prevents double-processing.
@@ -2189,6 +2236,253 @@ If `slack_token` and `slack_channel` are set in `~/.cheetahclaws/config.json`, t
 ╰───────────────────────────────────────────────╯
 ✓ Slack bridge started.
 ```
+
+---
+
+## Remote Control (Phone → Computer)
+
+All three bridges (Telegram, Slack, WeChat) include a persistent job queue and remote management commands so you can control long-running work from your phone.
+
+### Job queue
+
+When the AI is processing a query and a new message arrives, it is queued automatically — nothing is dropped.
+
+```
+Phone: "Run all tests"
+cheetahclaws: ⏳ Queued as job #a3f2 (position 1)
+              "Run all tests"
+              Use !jobs to check status.
+
+Phone: !jobs
+cheetahclaws: 📊 Job Dashboard
+              ────────────────────────────────────
+              🔄 #b7c1  [just now]  "Run all tests" — Bash: pytest…
+              ✅ #a3f2  [2m ago]    "Explain auth flow" (3 steps 18s)
+              ❌ #9d0e  [5m ago]    "Fix login bug" — ModuleNotFoundError
+
+              !job <id>  !retry <id>  !cancel
+```
+
+### Bridge commands (all three bridges)
+
+| Command | Description |
+|---|---|
+| `!jobs` or `!j` or `!status` | Show job dashboard (last 8 jobs, running first) |
+| `!job <id>` | Show full detail card for a job — steps, result preview, error |
+| `!retry <id>` | Re-run a failed job with the same prompt |
+| `!cancel` | Cancel the currently running job |
+| `!cancel <id>` | Cancel a specific job by ID |
+
+### Job tracking
+
+Each job records:
+- **Status** — queued → running → done / failed / cancelled
+- **Steps** — every tool call (`Bash`, `Read`, `Edit`, …) with result preview
+- **Result preview** — last 600 chars of the AI's response
+- **Duration** — wall-clock seconds from start to finish
+
+Jobs are persisted to `~/.cheetahclaws/jobs.json` (last 100 kept).
+
+### WeChat specifics
+
+WeChat uses **per-user queues** — each `user_id` gets an independent queue, so multiple WeChat users never block each other. All commands above are in Chinese: `!任务`, `!取消`, etc. are also accepted.
+
+---
+
+## Monitor — AI Subscriptions & Alerts
+
+`/monitor` turns cheetahclaws into a 24/7 AI research assistant that watches stocks, crypto, arxiv, world news, or any custom topic on a schedule and pushes AI-written reports to Telegram, Slack, or your terminal.
+
+### Quick start — interactive wizard
+
+```
+[myproject] ❯ /monitor
+
+╭─ AI Monitor + Decision Assistant ─────────────────────
+│  Monitor anything 24/7. AI summarizes & pushes to you.
+│
+│  What do you want to do?
+│
+│  1.  Add a new subscription
+│  2.  Run all subscriptions now  (preview reports)
+│  3.  Start background scheduler
+│  5.  Configure push notifications  (Telegram / Slack)
+│  0.  Exit
+╰────────────────────────────────────────────────────────
+
+  » 1
+```
+
+The wizard walks you through topic → schedule → delivery channel → run now → start scheduler. Zero prior knowledge required.
+
+### Available topics
+
+| Topic | Source | Example |
+|---|---|---|
+| `ai_research` | arxiv RSS (cs.AI/cs.LG/cs.CL) + weekend API fallback | `/subscribe ai_research` |
+| `stock_<TICKER>` | Yahoo Finance JSON API (no key) | `/subscribe stock_TSLA daily` |
+| `crypto_<SYMBOL>` | CoinGecko public API (no key) | `/subscribe crypto_BTC 6h` |
+| `world_news` | Reuters · BBC · Guardian · AP RSS | `/subscribe world_news --telegram` |
+| `custom:<query>` | DuckDuckGo Instant Answer | `/subscribe custom:quantum computing weekly` |
+
+### Schedules
+
+`15m` · `30m` · `1h` · `2h` · `6h` · `12h` · `daily` · `weekly`
+
+### Commands
+
+```
+/monitor                          # interactive wizard
+/monitor run [topic]              # run now and print report
+/monitor start                    # start background scheduler
+/monitor stop                     # stop background scheduler
+/monitor status                   # show scheduler state + subscriptions
+/monitor set telegram <t> <id>    # configure Telegram delivery
+/monitor set slack <t> <ch>       # configure Slack delivery
+/monitor topics                   # list all built-in topics
+
+/subscribe ai_research            # quick-add subscription (daily, auto channel)
+/subscribe stock_TSLA daily --telegram
+/subscriptions                    # list all active subscriptions
+/unsubscribe ai_research          # remove a subscription
+```
+
+### Sample report output
+
+```
+📊 AI Research Digest — 2026-04-12
+
+3 new papers on Large Language Models:
+
+• **RLVR-Pro** (Chen et al.) — New RL training method achieves +4.2% on MMLU
+  vs PPO baseline. Key insight: reward shaping with KL penalty prevents mode
+  collapse on reasoning tasks.
+
+• **FlashKV** (Park et al.) — KV-cache compression reducing memory 3× with
+  <0.5% perplexity loss. Applicable to any transformer at inference time.
+
+• **AgentBench-2** (Liu et al.) — 200-task evaluation suite for coding agents.
+  Claude-3.7 leads at 73.4%, GPT-5 at 71.1%.
+```
+
+---
+
+## Autonomous Agents
+
+`/agent` starts autonomous background agent loops driven by Markdown task templates (inspired by Karpathy's `program.md` pattern). Each agent gets an isolated `AgentState`, calls the real model with full tools, and runs until stopped or the task is complete.
+
+### Quick start — interactive wizard
+
+```
+[myproject] ❯ /agent
+
+╭────────────────────────────────────────────────────────╮
+│  🤖  Auto Agent  —  What do you want to do?            │
+╰────────────────────────────────────────────────────────╯
+
+  1  📚  Research Assistant
+        Read papers → summarize → build related work
+
+  2  🐛  Auto Bug Fixer
+        Run tests → find failures → fix & commit
+
+  3  ✍️   Paper Writer
+        Write paper sections from an outline
+
+  4  💻  Auto Coder
+        Implement tasks from a backlog → test → commit
+
+  5  📄  Custom template…
+        Use your own .md program file
+
+  q  Quit
+
+  Choice [1-5, q]: 1
+  Paper directory or search topic [.]: ~/papers/
+  Output notes file [research_notes.md]:
+  Agent name [research]:
+  Auto-approve file writes? [Y/n]: Y
+  Seconds between iterations [2]:
+
+  ─── Summary ───────────────────────────────────
+  Template  : research_assistant
+  Name      : research
+  Args      : ~/papers/ --output research_notes.md
+  Interval  : 2.0s
+  Auto-approve: True
+
+  Start? [Y/n]: Y
+✓ Agent 'research' is running.
+  Log  : ~/.cheetahclaws/agents/research/log.jsonl
+  Progress → this terminal (iterations print here).
+  Stop : /agent stop research
+```
+
+### Built-in templates
+
+| Template | What it does |
+|---|---|
+| `research_assistant` | Lists PDFs / searches topic → extracts key contributions → updates `research_notes.md` + `related_work.md` → repeats |
+| `auto_bug_fixer` | Runs `<test_cmd>` → reads failing test + source → fixes root cause → commits → repeats until green |
+| `paper_writer` | Reads outline → writes each section in academic style → appends to `paper_draft.md` → repeats section by section |
+| `auto_coder` | Reads `tasks.md` backlog → implements one task → tests → commits → marks done → repeats |
+
+### Direct launch (power user)
+
+```bash
+/agent start research_assistant ~/papers/
+/agent start auto_bug_fixer --test-cmd "pytest tests/" --repo .
+/agent start paper_writer outline.md --output paper_draft.md --style NeurIPS
+/agent start auto_coder --task "add rate limiting to the API"
+/agent start /path/to/my_template.md --name myagent
+```
+
+**Flags:** `--name <name>` · `--interval <seconds>` · `--no-auto-approve`
+
+### Agent lifecycle commands
+
+```
+/agent list                   # show all running agents + current status
+/agent status <name>          # show recent 3 iteration summaries
+/agent stop <name>            # stop a specific agent
+/agent stop all               # stop all running agents
+/agent templates              # list built-in + user templates
+```
+
+### Custom templates
+
+Drop any `.md` file into `~/.cheetahclaws/agent_templates/` following the program.md pattern:
+
+```markdown
+# My Custom Agent
+
+You are an autonomous agent. Your goal: <describe the goal>.
+
+## Setup (first iteration only)
+1. ...
+
+## Each iteration
+1. ...
+2. ...
+
+## Rules
+- Do not stop unless <condition>.
+- NEVER STOP unless explicitly stopped.
+```
+
+Templates are plain Markdown — no special syntax. The agent runs them as a system prompt.
+
+### Phone control
+
+Agents push iteration summaries to the active bridge (Telegram/Slack/WeChat) automatically. From your phone:
+
+```
+!agent list           # see all running agents
+!agent status research  # last 3 iterations of 'research'
+!agent stop research  # stop the agent
+```
+
+Iteration log is also persisted to `~/.cheetahclaws/agents/<name>/log.jsonl` for offline review.
 
 ---
 

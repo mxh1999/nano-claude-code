@@ -359,6 +359,8 @@ def cmd_ssj(args: str, state, config) -> bool:
         + "\n│  " + clr("10.", "bold") + " 📝  Promote — Idea to tasks"
         + ("\n│  " + clr("11.", "bold") + " 🎬  Video — AI video content factory" if _VIDEO_AVAILABLE else "")
         + ("\n│  " + clr("12.", "bold") + " 🎙  TTS   — AI voice generation (any style)" if _VOICE_MODULAR else "")
+        + "\n│  " + clr("13.", "bold") + " 📡  Monitor — AI subscriptions & alerts"
+        + "\n│  " + clr("14.", "bold") + " 🤖  Agent  — Autonomous task agents (research / bug-fix / code / write)"
         + "\n│  " + clr(" 0.", "bold") + " 🚪  Exit SSJ Mode  (or type q)"
         + "\n│"
         + "\n" + clr("╰──────────────────────────────────────────────", "dim")
@@ -477,6 +479,12 @@ def cmd_ssj(args: str, state, config) -> bool:
 
         elif choice == "12" and _VOICE_MODULAR:
             return ("__ssj_passthrough__", "/tts")
+
+        elif choice == "13":
+            return ("__ssj_passthrough__", "/monitor")
+
+        elif choice == "14":
+            return ("__ssj_passthrough__", "/agent")
 
         else:
             err(f"Invalid choice: {choice}")

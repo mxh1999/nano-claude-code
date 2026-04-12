@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time as _time_mod
 import base64 as _b64_mod
 import struct as _struct_mod
 import secrets as _secrets_mod
@@ -23,9 +24,16 @@ import secrets as _secrets_mod
 from ui.render import clr, info, ok, warn, err
 import runtime
 import logging_utils as _log
+import jobs as _jobs
 
 _wechat_thread: threading.Thread | None = None
 _wechat_stop = threading.Event()
+
+# ── Per-user job queues (WeChat is multi-user) ─────────────────────────────
+# key: from_uid → list of (job_id, prompt)
+_wx_queues: dict[str, list[tuple[str, str]]] = {}
+_wx_queues_lock = threading.Lock()
+_wx_busy: dict[str, bool] = {}   # from_uid → is_processing
 
 _ILINK_BASE_URL         = "https://ilinkai.weixin.qq.com"
 _ILINK_APP_ID           = "bot"
@@ -498,90 +506,219 @@ def _wx_poll_loop(token: str, base_url: str, config: dict) -> str:
                                      daemon=True).start()
                     continue
 
-                # ── Claude query: stream in timed paragraphs ───────────────
-                # WeChat does not support message editing, so we buffer chunks
-                # and send a new message every ~3 seconds as text arrives.
-                def _wx_bg_runner(q_text, uid):
-                    import time as _time
+                # ── Job dashboard & control commands ───────────────────────
+                stripped_lower = text.strip().lower()
+                if stripped_lower in ("!jobs", "!j", "!status"):
+                    _wx_send(from_uid, _jobs.format_dashboard(), config)
+                    continue
 
-                    _typing_stop = threading.Event()
-                    _typing_t = threading.Thread(
-                        target=_wx_typing_loop, args=(uid, _typing_stop, config), daemon=True
-                    )
-                    _typing_t.start()
+                if stripped_lower.startswith("!job "):
+                    jid = text.strip().split(None, 1)[1].lstrip("#").strip()
+                    _wx_send(from_uid, _jobs.format_detail(jid), config)
+                    continue
 
-                    _chunks: list[str] = []
-                    _last_send = [_time.monotonic()]
-                    _stream_lock = threading.Lock()
-                    _WX_STREAM_INTERVAL = 3.0   # send partial response every 3 s
-                    _WX_STREAM_MIN_LEN  = 80    # don't send tiny fragments
+                if stripped_lower.startswith("!retry "):
+                    jid = text.strip().split(None, 1)[1].lstrip("#").strip()
+                    original = _jobs.get(jid)
+                    if not original:
+                        _wx_send(from_uid, f"❓ Job #{jid} not found.", config)
+                        continue
+                    retry_job = _jobs.create(original.prompt, source="wechat",
+                                             retry_of=original.id)
+                    _wx_send(from_uid,
+                             f"↩ Retrying #{jid} as #{retry_job.id}:\n\"{original.title}\"",
+                             config)
+                    _dispatch_wx_job(retry_job, original.prompt, from_uid,
+                                     run_query_cb, session_ctx, config)
+                    continue
 
-                    def _flush_chunks():
-                        text_so_far = "".join(_chunks)
-                        if len(text_so_far) >= _WX_STREAM_MIN_LEN:
-                            _wx_send(uid, text_so_far[-2000:], config)
-                            _chunks.clear()
-                        _last_send[0] = _time.monotonic()
+                if stripped_lower in ("!cancel", "!kill"):
+                    running = _jobs.list_running()
+                    if running:
+                        for j in running:
+                            _jobs.cancel(j.id)
+                        _wx_send(from_uid, f"🚫 已取消 {len(running)} 个任务", config)
+                    else:
+                        _wx_send(from_uid, "ℹ 当前没有运行中的任务", config)
+                    continue
 
-                    def _on_chunk(chunk: str):
-                        _chunks.append(chunk)
-                        with _stream_lock:
-                            if _time.monotonic() - _last_send[0] >= _WX_STREAM_INTERVAL:
-                                _flush_chunks()
+                if stripped_lower.startswith(("!cancel ", "!kill ")):
+                    jid = text.strip().split(None, 1)[1].lstrip("#").strip()
+                    j = _jobs.get(jid)
+                    if j:
+                        _jobs.cancel(jid)
+                        _wx_send(from_uid, f"🚫 任务 #{jid} 已取消", config)
+                    else:
+                        _wx_send(from_uid, f"❓ 找不到任务 #{jid}", config)
+                    continue
 
-                    def _on_tool_start(name: str, inputs: dict):
-                        cmd_preview = str(inputs.get("command", inputs.get("file_path", ""))).strip()[:60]
-                        label = f"🔧 {name}" + (f": {cmd_preview}" if cmd_preview else "")
-                        _wx_send(uid, label, config)
+                # ── Wizard / interactive input pending ────────────────────
+                _pending_evt = getattr(session_ctx, "wx_input_event", None)
+                if _pending_evt is not None:
+                    session_ctx.wx_input_value = text
+                    _pending_evt.set()
+                    continue
 
-                    session_ctx.on_text_chunk = _on_chunk
-                    session_ctx.on_tool_start = _on_tool_start
-                    session_ctx.on_tool_end   = None
+                # ── Claude query: create job, queue if busy, else run now ──
+                job = _jobs.create(text, source="wechat")
 
-                    config["_wx_current_user_id"] = uid
-                    config["_in_wechat_turn"] = True
-                    try:
-                        if run_query_cb:
-                            run_query_cb(q_text)
-                    except Exception as e:
-                        _typing_stop.set()
-                        _wx_send(uid, f"⚠ Error: {e}", config)
-                        return
-                    finally:
-                        session_ctx.on_text_chunk = None
-                        session_ctx.on_tool_start = None
-                        config.pop("_in_wechat_turn", None)
-                        config.pop("_wx_current_user_id", None)
+                if _wx_busy.get(from_uid):
+                    with _wx_queues_lock:
+                        _wx_queues.setdefault(from_uid, []).append((job.id, text))
+                    queue_pos = len(_wx_queues[from_uid])
+                    _wx_send(from_uid,
+                             f"⏳ 已排队 #{job.id}（第 {queue_pos} 位）\n"
+                             f"「{job.title}」\n"
+                             f"发 !jobs 查看进度",
+                             config)
+                    continue
 
-                    _typing_stop.set()
-                    # Send whatever remains in the chunk buffer
-                    remaining = "".join(_chunks).strip()
-                    if remaining:
-                        _wx_send(uid, remaining, config)
-                    elif not _chunks:
-                        # Nothing streamed — fall back to state.messages
-                        state = session_ctx.agent_state
-                        if state and state.messages:
-                            for m in reversed(state.messages):
-                                if m.get("role") == "assistant":
-                                    content = m.get("content", "")
-                                    if isinstance(content, list):
-                                        content = "\n".join(
-                                            b.get("text", "") if isinstance(b, dict) and b.get("type") == "text"
-                                            else (b if isinstance(b, str) else "")
-                                            for b in content
-                                        )
-                                    if content:
-                                        _wx_send(uid, content, config)
-                                    break
-
-                threading.Thread(target=_wx_bg_runner, args=(text, from_uid), daemon=True).start()
+                _dispatch_wx_job(job, text, from_uid, run_query_cb, session_ctx, config)
 
         except Exception:
             _wechat_stop.wait(5)
 
     session_ctx.wx_send = None
     return "stopped"
+
+
+# ── Job dispatch & background runner ──────────────────────────────────────
+
+def _dispatch_wx_job(job, q_text: str, uid: str,
+                     run_query_cb, session_ctx, config: dict) -> None:
+    """Fire job in a background thread for this user, then drain their queue."""
+    def _run():
+        _wx_busy[uid] = True
+        try:
+            _wx_bg_runner(job, q_text, uid, run_query_cb, session_ctx, config)
+        finally:
+            _wx_busy[uid] = False
+            _drain_wx_queue(uid, run_query_cb, session_ctx, config)
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _drain_wx_queue(uid: str, run_query_cb, session_ctx, config: dict) -> None:
+    with _wx_queues_lock:
+        queue = _wx_queues.get(uid, [])
+        if not queue:
+            return
+        job_id, prompt = queue.pop(0)
+
+    job = _jobs.get(job_id)
+    if not job or job.status == "cancelled":
+        _drain_wx_queue(uid, run_query_cb, session_ctx, config)
+        return
+
+    remaining = len(_wx_queues.get(uid, []))
+    pos_msg = f"（还有 {remaining} 个待处理）" if remaining else ""
+    _wx_send(uid, f"▶ 开始执行 #{job_id}{pos_msg}：\n「{job.title}」", config)
+    _dispatch_wx_job(job, prompt, uid, run_query_cb, session_ctx, config)
+
+
+def _wx_bg_runner(job, q_text: str, uid: str,
+                  run_query_cb, session_ctx, config: dict) -> None:
+    """Execute one WeChat AI query with job tracking.
+
+    WeChat does not support message editing — we buffer chunks and send
+    a new message every ~3 seconds as text arrives.
+    """
+    _jobs.start(job.id)
+
+    _wx_send(uid, f"⏳ 任务 #{job.id} 执行中…", config)
+
+    _typing_stop = threading.Event()
+    threading.Thread(
+        target=_wx_typing_loop, args=(uid, _typing_stop, config), daemon=True
+    ).start()
+
+    _chunks: list[str] = []
+    _last_send = [_time_mod.monotonic()]
+    _stream_lock = threading.Lock()
+    _WX_STREAM_INTERVAL = 3.0
+    _WX_STREAM_MIN_LEN  = 80
+    _result_buf: list[str] = []   # accumulate full result for job record
+
+    def _flush_chunks():
+        text_so_far = "".join(_chunks)
+        if len(text_so_far) >= _WX_STREAM_MIN_LEN:
+            _wx_send(uid, text_so_far[-2000:], config)
+            _result_buf.append(text_so_far)
+            _chunks.clear()
+        _last_send[0] = _time_mod.monotonic()
+
+    def _on_chunk(chunk: str):
+        _chunks.append(chunk)
+        _jobs.stream_result(job.id, chunk)
+        with _stream_lock:
+            if _time_mod.monotonic() - _last_send[0] >= _WX_STREAM_INTERVAL:
+                _flush_chunks()
+
+    def _on_tool_start(name: str, inputs: dict):
+        preview = str(inputs.get("command",
+                      inputs.get("file_path",
+                      inputs.get("pattern",
+                      inputs.get("query", ""))))).strip()[:60]
+        _jobs.add_step(job.id, name, preview)
+        label = f"🔧 {name}" + (f": {preview}" if preview else "")
+        _wx_send(uid, label, config)
+
+    def _on_tool_end(name: str, result: str):
+        _jobs.finish_step(job.id, name, result[:80] if result else "")
+
+    session_ctx.on_text_chunk = _on_chunk
+    session_ctx.on_tool_start = _on_tool_start
+    session_ctx.on_tool_end   = _on_tool_end   # ← now wired
+
+    config["_wx_current_user_id"] = uid
+    config["_in_wechat_turn"] = True
+    try:
+        if run_query_cb:
+            run_query_cb(q_text)
+    except Exception as e:
+        _typing_stop.set()
+        _jobs.fail(job.id, str(e))
+        _wx_send(uid, f"❌ 任务 #{job.id} 失败：{e}\n↩ 重试：!retry {job.id}", config)
+        return
+    finally:
+        session_ctx.on_text_chunk = None
+        session_ctx.on_tool_start = None
+        session_ctx.on_tool_end   = None
+        config.pop("_in_wechat_turn", None)
+        config.pop("_wx_current_user_id", None)
+
+    _typing_stop.set()
+
+    # Flush remaining chunks
+    remaining_text = "".join(_chunks).strip()
+    if remaining_text:
+        _wx_send(uid, remaining_text, config)
+        _result_buf.append(remaining_text)
+    elif not _chunks and not _result_buf:
+        # Nothing streamed — fall back to state.messages
+        state = session_ctx.agent_state
+        if state and state.messages:
+            for m in reversed(state.messages):
+                if m.get("role") == "assistant":
+                    content = m.get("content", "")
+                    if isinstance(content, list):
+                        content = "\n".join(
+                            b.get("text", "") if isinstance(b, dict) and b.get("type") == "text"
+                            else (b if isinstance(b, str) else "")
+                            for b in content
+                        )
+                    if content:
+                        _wx_send(uid, content, config)
+                        _result_buf.append(content)
+                    break
+
+    full_result = "".join(_result_buf)
+    _jobs.complete(job.id, full_result)
+
+    # Send compact completion notice
+    j = _jobs.get(job.id)
+    if j and j.step_count > 0:
+        dur = f"  {j.duration_s:.0f}s" if j.duration_s else ""
+        _wx_send(uid, f"✅ 任务 #{job.id} 完成（{j.step_count} 步{dur}）", config)
 
 
 _WX_BACKOFF_INITIAL = 2.0

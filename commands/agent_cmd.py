@@ -32,11 +32,20 @@ from ui.render import info, ok, warn, err, clr
 
 # ── Wizard helpers ─────────────────────────────────────────────────────────
 
-def _ask(prompt: str, default: str = "") -> str:
-    """Prompt with optional default; Ctrl-C → returns '' to signal abort."""
+def _ask(prompt: str, default: str = "", config: dict | None = None) -> str:
+    """Prompt with optional default. Routes to Telegram/Slack/WeChat when in
+    bridge context (via ask_input_interactive); falls back to terminal input."""
     suffix = f" [{clr(default, 'dim')}]" if default else ""
+    full_prompt = f"  {prompt}{suffix}: "
+    if config is not None:
+        try:
+            from tools import ask_input_interactive
+            val = ask_input_interactive(clr(full_prompt, "cyan"), config).strip()
+            return val if val else default
+        except (KeyboardInterrupt, EOFError):
+            return "\x00"
     try:
-        val = input(f"  {prompt}{suffix}: ").strip()
+        val = input(clr(full_prompt, "cyan")).strip()
         return val if val else default
     except (KeyboardInterrupt, EOFError):
         return "\x00"   # sentinel = cancelled
@@ -67,14 +76,31 @@ def _wizard(config: dict) -> bool:
     """Interactive wizard — returns True when done (start or abort)."""
     from agent_runner import list_templates, start_runner, get_runner
 
+    def _q(prompt: str, default: str = "") -> str:
+        """Bridge-aware ask, closed over config."""
+        return _ask(prompt, default, config)
+
     # ── Menu ──────────────────────────────────────────────────────────────
+    _menu_text = "🤖  Auto Agent  —  What do you want to do?\n"
+    for i, (_, icon, label, desc) in enumerate(_MENU_ITEMS, 1):
+        _menu_text += f"\n  {i}  {icon}  {label}\n     {desc}\n"
+    _menu_text += f"\n  q  Quit"
+
+    # Print for terminal; bridge users see it bundled with the prompt
     _hdr("🤖  Auto Agent  —  What do you want to do?")
     for i, (_, icon, label, desc) in enumerate(_MENU_ITEMS, 1):
         print(f"  {clr(str(i), 'yellow')}  {icon}  {clr(label, 'bold')}")
         print(f"        {clr(desc, 'dim')}\n")
     print(f"  {clr('q', 'yellow')}  Quit\n")
 
-    choice_raw = _ask("Choice [1-5, q]", "")
+    try:
+        from tools import ask_input_interactive
+        choice_raw = ask_input_interactive(
+            clr("  Choice [1-5, q]: ", "cyan"), config, _menu_text
+        ).strip()
+    except Exception:
+        choice_raw = _q("Choice [1-5, q]", "")
+
     if choice_raw in ("\x00", "q", "Q", ""):
         info("Cancelled.")
         return True
@@ -99,52 +125,49 @@ def _wizard(config: dict) -> bool:
     auto_approve = True
 
     if template_name == "research_assistant":
-        target = _ask("Paper directory or search topic", ".")
+        target = _q("Paper directory or search topic", ".")
         if target == "\x00": info("Cancelled."); return True
-        notes_out = _ask("Output notes file", "research_notes.md")
+        notes_out = _q("Output notes file", "research_notes.md")
         if notes_out == "\x00": info("Cancelled."); return True
-        agent_name = _ask("Agent name", "research")
+        agent_name = _q("Agent name", "research")
         if agent_name == "\x00": info("Cancelled."); return True
-        aa = _ask("Auto-approve file writes? [Y/n]", "Y")
+        aa = _q("Auto-approve file writes? [Y/n]", "Y")
         if aa == "\x00": info("Cancelled."); return True
         auto_approve = aa.strip().lower() not in ("n", "no")
         agent_args = f"{target} --output {notes_out}"
 
     elif template_name == "auto_bug_fixer":
-        test_cmd = _ask("Test command", "pytest")
+        test_cmd = _q("Test command", "pytest")
         if test_cmd == "\x00": info("Cancelled."); return True
-        repo = _ask("Repo directory", ".")
+        repo = _q("Repo directory", ".")
         if repo == "\x00": info("Cancelled."); return True
-        agent_name = _ask("Agent name", "bugfix")
+        agent_name = _q("Agent name", "bugfix")
         if agent_name == "\x00": info("Cancelled."); return True
-        aa = _ask("Auto-approve shell commands? [Y/n]", "Y")
+        aa = _q("Auto-approve shell commands? [Y/n]", "Y")
         if aa == "\x00": info("Cancelled."); return True
         auto_approve = aa.strip().lower() not in ("n", "no")
         agent_args = f"--test-cmd {shlex.quote(test_cmd)} --repo {shlex.quote(repo)}"
 
     elif template_name == "paper_writer":
-        outline = _ask("Outline file path (required)", "")
+        outline = _q("Outline file path (required)", "")
         if outline in ("\x00", ""):
             err("Outline file is required.") if outline != "\x00" else info("Cancelled.")
             return True
-        output = _ask("Output draft file", "paper_draft.md")
+        output = _q("Output draft file", "paper_draft.md")
         if output == "\x00": info("Cancelled."); return True
-        style = _ask("Writing style/venue", "NeurIPS")
+        style = _q("Writing style/venue", "NeurIPS")
         if style == "\x00": info("Cancelled."); return True
-        agent_name = _ask("Agent name", "paper")
+        agent_name = _q("Agent name", "paper")
         if agent_name == "\x00": info("Cancelled."); return True
         auto_approve = True
         agent_args = f"{shlex.quote(outline)} --output {shlex.quote(output)} --style {shlex.quote(style)}"
 
     elif template_name == "auto_coder":
-        task_input = _ask(
-            "Task description  (or path to tasks.md)",
-            "tasks.md",
-        )
+        task_input = _q("Task description  (or path to tasks.md)", "tasks.md")
         if task_input == "\x00": info("Cancelled."); return True
-        agent_name = _ask("Agent name", "coder")
+        agent_name = _q("Agent name", "coder")
         if agent_name == "\x00": info("Cancelled."); return True
-        aa = _ask("Auto-approve shell commands? [Y/n]", "Y")
+        aa = _q("Auto-approve shell commands? [Y/n]", "Y")
         if aa == "\x00": info("Cancelled."); return True
         auto_approve = aa.strip().lower() not in ("n", "no")
         p = Path(task_input)
@@ -154,23 +177,23 @@ def _wizard(config: dict) -> bool:
             agent_args = f"--task {shlex.quote(task_input)}"
 
     elif template_name == "__custom__":
-        tpl_path = _ask("Template file path (.md)", "")
+        tpl_path = _q("Template file path (.md)", "")
         if tpl_path in ("\x00", ""):
             err("Template path is required.") if tpl_path != "\x00" else info("Cancelled.")
             return True
         template_name = tpl_path
         agent_name_default = Path(tpl_path).stem
-        agent_name = _ask("Agent name", agent_name_default)
+        agent_name = _q("Agent name", agent_name_default)
         if agent_name == "\x00": info("Cancelled."); return True
-        extra = _ask("Extra args (optional)", "")
+        extra = _q("Extra args (optional)", "")
         if extra == "\x00": info("Cancelled."); return True
-        aa = _ask("Auto-approve operations? [Y/n]", "Y")
+        aa = _q("Auto-approve operations? [Y/n]", "Y")
         if aa == "\x00": info("Cancelled."); return True
         auto_approve = aa.strip().lower() not in ("n", "no")
         agent_args = extra
 
     # ── Interval ──────────────────────────────────────────────────────────
-    interval_str = _ask("Seconds between iterations", "2")
+    interval_str = _q("Seconds between iterations", "2")
     if interval_str == "\x00": info("Cancelled."); return True
     try:
         interval = max(0.5, float(interval_str))
@@ -187,7 +210,7 @@ def _wizard(config: dict) -> bool:
     print(f"  Auto-approve: {auto_approve}")
     print()
 
-    confirm = _ask("Start? [Y/n]", "Y")
+    confirm = _q("Start? [Y/n]", "Y")
     if confirm in ("\x00",) or confirm.strip().lower() in ("n", "no"):
         info("Cancelled.")
         return True

@@ -77,6 +77,17 @@ Slash commands in REPL:
   /cloudsave auto on|off     Toggle auto-upload on exit
   /cloudsave list   List your cheetahclaws Gists
   /cloudsave load <gist_id>  Download and load a session from Gist
+  /subscribe <topic> [schedule] [--telegram] [--slack]
+                    Subscribe to AI-monitored topic (ai_research, stock_TSLA, crypto_BTC, world_news, custom:<query>)
+  /subscriptions    List active subscriptions
+  /unsubscribe <topic>  Remove a subscription
+  /monitor run [topic]  Run monitor(s) now and print AI report
+  /monitor start    Start background scheduler (runs subscriptions on schedule)
+  /monitor stop     Stop background scheduler
+  /monitor status   Show scheduler status and subscription overview
+  /monitor set telegram <token> <chat_id>  Configure Telegram delivery
+  /monitor set slack <token> <channel_id>  Configure Slack delivery
+  /monitor topics   List available built-in topics
   /telegram <bot_token> <chat_id>  Start Telegram bridge
   /telegram stop|status             Stop or check Telegram bridge
   /wechat login                     Authenticate WeChat via QR code
@@ -158,6 +169,9 @@ from commands.advanced import (
 
 # ── Agent (autonomous loop) command ───────────────────────────────────────
 from commands.agent_cmd import cmd_agent
+
+# ── Monitor / Subscribe commands ──────────────────────────────────────────
+from commands.monitor_cmd import cmd_subscribe, cmd_subscriptions, cmd_unsubscribe, cmd_monitor
 
 # ── Tools / thread-local bridge state ─────────────────────────────────────
 from tools import (
@@ -288,6 +302,11 @@ COMMANDS = {
     "checkpoint":  cmd_checkpoint,
     "rewind":      cmd_rewind,
     "plan":        cmd_plan,
+    "subscribe":   cmd_subscribe,
+    "subscriptions": cmd_subscriptions,
+    "subs":        cmd_subscriptions,
+    "unsubscribe": cmd_unsubscribe,
+    "monitor":     cmd_monitor,
     "compact":     cmd_compact,
     "init":        cmd_init,
     "export":      cmd_export,
