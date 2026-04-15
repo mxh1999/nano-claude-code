@@ -117,14 +117,20 @@ VENV_DIR="$HOME/.cheetahclaws-venv"
 USE_VENV=false
 
 # Detect PEP 668 externally-managed Python (Homebrew Python 3.12+, Debian 12+, etc.)
-if $PYTHON -m pip install --dry-run . 2>&1 | grep -q "externally-managed-environment"; then
+# Check for the EXTERNALLY-MANAGED marker file that pip reads
+STDLIB_PATH=$($PYTHON -c "import sysconfig; print(sysconfig.get_path('stdlib'))" 2>/dev/null || echo "")
+if [ -n "$STDLIB_PATH" ] && [ -f "$STDLIB_PATH/EXTERNALLY-MANAGED" ]; then
     USE_VENV=true
     info "Detected externally-managed Python (PEP 668) — using virtual environment."
 fi
 
-# macOS Homebrew Python: always use venv to avoid --break-system-packages issues
-if [ "$PLATFORM" = "macos" ] && $PYTHON -c "import sysconfig; print(sysconfig.get_path('stdlib'))" 2>/dev/null | grep -q "Cellar\|homebrew"; then
-    USE_VENV=true
+# macOS: always use venv (Homebrew, system Python, or any managed env)
+if [ "$PLATFORM" = "macos" ] && [ "$USE_VENV" = false ]; then
+    # Check if pip would refuse (belt-and-suspenders)
+    if ! $PYTHON -m pip install --quiet --dry-run pip 2>/dev/null; then
+        USE_VENV=true
+        info "macOS pip restricted — using virtual environment."
+    fi
 fi
 
 if [ "$USE_VENV" = true ]; then
