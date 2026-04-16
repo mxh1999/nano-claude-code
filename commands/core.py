@@ -2,7 +2,7 @@
 commands/core.py — Core utility commands for CheetahClaws.
 
 Commands: /help, /clear, /context, /cost, /compact, /init, /export,
-          /copy, /status, /doctor, /proactive, /image
+          /copy, /status, /doctor, /proactive, /image, /circuit
 """
 from __future__ import annotations
 
@@ -674,3 +674,59 @@ def cmd_image(args: str, state, config) -> Union[bool, tuple]:
 
     prompt = args.strip() if args.strip() else "What do you see in this image? Describe it in detail."
     return ("__image__", prompt)
+
+
+def cmd_circuit(args: str, state, config) -> bool:
+    """Inspect and manage per-provider circuit breakers.
+
+    /circuit                    — list all breakers and their state
+    /circuit status [provider]  — same as above, optionally filtered
+    /circuit reset <provider>   — force-close a breaker (or 'all')
+    """
+    import circuit_breaker as _cb
+
+    parts = args.strip().split()
+    sub = parts[0].lower() if parts else "status"
+    target = parts[1] if len(parts) > 1 else ""
+
+    if sub in ("reset", "close", "clear"):
+        if not target:
+            err("Usage: /circuit reset <provider>  (or 'all')")
+            return True
+        if target.lower() == "all":
+            names = list(_cb._registry.keys())
+            if not names:
+                info("No circuit breakers to reset.")
+                return True
+            for name in names:
+                _cb.reset_breaker(name)
+            ok(f"Reset {len(names)} circuit breaker(s): {', '.join(names)}")
+            return True
+        if target not in _cb._registry:
+            warn(f"No circuit breaker registered for '{target}'. Nothing to reset.")
+            return True
+        _cb.reset_breaker(target)
+        ok(f"Circuit breaker for '{target}' reset (force-closed).")
+        return True
+
+    if sub not in ("status", ""):
+        err(f"Unknown /circuit subcommand: {sub}. Use: status | reset")
+        return True
+
+    breakers = _cb._registry
+    if target:
+        breakers = {k: v for k, v in breakers.items() if k == target}
+
+    if not breakers:
+        info("No circuit breakers active yet (none have been exercised this session).")
+        return True
+
+    for name, b in breakers.items():
+        st = b.state.value
+        color = {"closed": "green", "half_open": "yellow", "open": "red"}.get(st, "dim")
+        line = f"  {name:<12} state={clr(st, color)}  failures={len(b._failure_times)}/{b.threshold}"
+        if b._opened_at is not None and b.state.value == "open":
+            remaining = max(0.0, b.cooldown - (time.monotonic() - b._opened_at))
+            line += f"  cooldown_remaining={remaining:.0f}s"
+        print(line)
+    return True

@@ -197,7 +197,7 @@ from commands.config_cmd import (
 from commands.core import (
     cmd_help, cmd_clear, cmd_context, cmd_cost, cmd_compact,
     cmd_init, cmd_export, cmd_copy, cmd_status, cmd_doctor,
-    cmd_proactive, cmd_image, run_setup_wizard,
+    cmd_proactive, cmd_image, cmd_circuit, run_setup_wizard,
 )
 
 # ── Checkpoint / Plan commands ─────────────────────────────────────────────
@@ -374,6 +374,7 @@ COMMANDS = {
     "copy":        cmd_copy,
     "status":      cmd_status,
     "doctor":      cmd_doctor,
+    "circuit":     cmd_circuit,
     "setup":       lambda a, s, c: (run_setup_wizard(c), True)[1],
     "exit":        cmd_exit,
     "quit":        cmd_exit,
@@ -508,6 +509,7 @@ _CMD_META: dict[str, tuple[str, list[str]]] = {
     "copy":        ("Copy last response to clipboard",      []),
     "status":      ("Show session status and model info",   []),
     "doctor":      ("Diagnose installation health",         []),
+    "circuit":     ("Show / reset per-provider circuit breakers", ["status", "reset"]),
     "setup":       ("Run interactive setup wizard",         []),
     "exit":        ("Exit cheetahclaws",              []),
     "quit":        ("Exit (alias for /exit)",             []),
