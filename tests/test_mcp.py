@@ -377,7 +377,7 @@ sys.stdout.flush()
 
         cfg = MCPServerConfig.from_dict("echo", {
             "type": "stdio",
-            "command": "python3",
+            "command": sys.executable,
             "args": [str(script)],
             "timeout": 5,
         })
