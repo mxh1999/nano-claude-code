@@ -4,6 +4,7 @@ from .store import (
     install_plugin, uninstall_plugin,
     enable_plugin, disable_plugin, disable_all_plugins,
     update_plugin, list_plugins, get_plugin,
+    PLUGIN_PATH_ENV,
 )
 from .loader import (
     load_all_plugins, load_plugin_tools, load_plugin_skills,
@@ -16,6 +17,7 @@ __all__ = [
     "install_plugin", "uninstall_plugin",
     "enable_plugin", "disable_plugin", "disable_all_plugins",
     "update_plugin", "list_plugins", "get_plugin",
+    "PLUGIN_PATH_ENV",
     "load_all_plugins", "load_plugin_tools", "load_plugin_skills",
     "load_plugin_mcp_configs", "register_plugin_tools",
     "recommend_plugins", "recommend_from_files", "format_recommendations",

@@ -9,8 +9,9 @@ from typing import Any
 
 
 class PluginScope(str, Enum):
-    USER    = "user"     # ~/.cheetahclaws/plugins/
-    PROJECT = "project"  # .cheetahclaws/plugins/ (cwd)
+    USER     = "user"      # ~/.cheetahclaws/plugins/
+    PROJECT  = "project"   # .cheetahclaws/plugins/ (cwd)
+    EXTERNAL = "external"  # scanned from $CHEETAHCLAWS_PLUGIN_PATH
 
 
 @dataclass
