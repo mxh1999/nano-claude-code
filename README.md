@@ -132,7 +132,7 @@ Other install methods: [pip install](#alternative-install-with-pip) | [uv instal
 ## 🔥🔥🔥 News (Pacific Time)
 
  
-- Apr 20, 2026 (**v3.05.76**): **Research pipeline — 20 sources across academia/tech/finance/社交/web + cross-platform attention heat table, publication trend sparkline, notable-citer analysis, entity extraction, multi-query expansion, side-by-side compare, saved reports, weekly trend tracking via `/monitor`, one-click `/ssj` wizard. Chinese platforms: 知乎 · B站 · 微博 · 小红书.**
+- Apr 20, 2026 (**v3.05.76**): **Research pipeline — 20 sources across academia/tech/finance/社交/web + cross-platform attention heat table, publication trend sparkline, notable-citer analysis, entity extraction, multi-query expansion, side-by-side compare, saved reports, weekly trend tracking via `/monitor`, one-click `/ssj` wizard. Chinese platforms: Zhihu (知乎) · Bilibili (B站) · Weibo (微博) · Rednote (小红书).**
 - Apr 18, 2026 (**v3.05.75**): **External plugin discovery via `CHEETAHCLAWS_PLUGIN_PATH` + safer dependency management; tool-history integrity fix for OpenAI-compatible providers (DeepSeek et al.); end-to-end prompt-cache token tracking across providers with full checkpoint round-trip**
 - Apr 16, 2026 (**v3.05.74**): **Web UI production hardening — persistence, multi-user auth, ops endpoints, JS module split, pytest suite**
   
