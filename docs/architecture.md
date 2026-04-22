@@ -1,353 +1,763 @@
 # Architecture Guide
 
-This document is for developers who want to understand, modify, or extend cheetahclaws.
-For user-facing docs, see [README.md](../README.md).
+This document is for contributors who want to understand, modify, or
+extend CheetahClaws — the *why* and *how* behind the code, not the PR
+checklist.  For the quick-start flow, pointers on where to add things,
+and the PR checklist, see [CONTRIBUTING.md](../CONTRIBUTING.md).  For
+the user-facing surface (CLI flags, slash commands, provider setup),
+see [README.md](../README.md).
 
 ---
 
 ## Overview
 
-Nano-claude-code is a ~3.4K-line Python CLI that lets LLMs (GPT, Gemini, etc.) operate as
-coding agents with tool use, memory, sub-agents, and skills. The architecture is a flat
-module layout designed for readability and future migration to a package structure.
+CheetahClaws is a Python-native terminal AI coding assistant that
+speaks to any LLM provider (Anthropic, OpenAI, Gemini, Kimi, Qwen,
+Zhipu, DeepSeek, MiniMax, Ollama, LM Studio, any OpenAI-compatible
+endpoint).  It started as a ~900-line single-file script and has grown
+into a roughly 45 KLoC multi-package codebase; the repository is in a
+**mostly-package layout with intentional backward-compat shims** at the
+top level.
+
+The high-level shape:
 
 ```
-User Input
-    │
-    ▼
-cheetahclaws.py  ── REPL, slash commands, rendering
-    │
-    ├──► agent.py  ── multi-turn loop, permission gates
-    │       │
-    │       ├──► providers.py  ── API streaming (Anthropic / OpenAI-compat)
-    │       ├──► tool_registry.py ──► tools.py  ── 13 tools
-    │       ├──► compaction.py  ── context window management
-    │       └──► subagent.py  ── threaded sub-agent lifecycle
-    │
-    ├──► context.py  ── system prompt (git, CLAUDE.md, memory)
-    │       └──► memory.py  ── persistent file-based memory
-    │
-    ├──► skills.py  ── markdown skill loading + execution
-    └──► config.py  ── configuration persistence
+                        User Input
+                            │
+                            ▼
+   ┌───────────────────────────────────────────────────────────┐
+   │  cheetahclaws.py  —  REPL, slash dispatch, permission UI   │
+   └────┬──────────────────────────────┬───────────────────────┘
+        │                              │
+        │    ┌─────────────────────────┴──────────────┐
+        │    │                                        │
+        ▼    ▼                                        ▼
+   bootstrap.py                                   commands/
+   (logging → tool registry                        (/save /load /model
+    → health HTTP server)                           /plan /agent /mcp
+        │                                           /brainstorm /ssj …)
+        ▼
+   agent.py ── multi-turn generator loop
+        │
+        ├──► context.py ── system prompt (base template + env +
+        │                   memory index + tmux / plan blocks)
+        │
+        ├──► providers.py ── stream adapter (anthropic + openai-compat)
+        │
+        ├──► tool_registry.py ──► tools/  (fs, shell, web, notebook,
+        │                                  diagnostics, interaction, …)
+        │                        + memory/, multi_agent/, skill/, cc_mcp/,
+        │                          task/, checkpoint/hooks, plugins, modular/
+        │
+        ├──► compaction.py ── snip + LLM-summarize old turns
+        │
+        ├──► quota.py + circuit_breaker.py + error_classifier.py
+        │         (API-failure resilience layer, always on)
+        │
+        └──► runtime.py ── RuntimeContext (per-session live state)
+                │
+                └──► bridges/  (telegram / wechat / slack) wire
+                     incoming messages to runtime callbacks
 ```
 
-**Key invariant:** Dependencies flow downward. No circular imports at the module level
-(subagent.py uses lazy imports to call agent.py).
+**Dependencies flow downward**: nothing in `tools/` or feature packages
+imports from `cheetahclaws.py` or `agent.py` at module load time.
+Circular references are broken with lazy imports inside functions
+(`multi_agent.subagent` calls back into `agent` this way).
 
 ---
 
-## Module Reference
+## Repository layout
 
-### `tool_registry.py` — Tool Plugin System
+Three layers coexist in this repo, on purpose:
 
-The central registry that all tools register into. This is the foundation for extensibility.
+### 1. Top-level runtime (root `.py` files)
 
-**Data model:**
+These are the per-session, per-turn workhorses.  Each one has a narrow
+responsibility.
+
+| Module | Role |
+|---|---|
+| [`cheetahclaws.py`](../cheetahclaws.py) | REPL shell, `COMMANDS` dispatch, permission prompt UI, streaming render, entry point (`main()`) |
+| [`bootstrap.py`](../bootstrap.py) | Explicit startup sequence — configure logging, import `tools` (triggers registrations), optionally start health HTTP server.  Idempotent. |
+| [`agent.py`](../agent.py) | Multi-turn agent loop (generator yielding typed events), permission gating, parallel tool execution, retry-with-backoff on API errors |
+| [`agent_runner.py`](../agent_runner.py) | Autonomous loop runner — runs a Markdown agent template (`agent_templates/*.md`) in a background thread, with iteration logging and bridge notifications |
+| [`context.py`](../context.py) | System-prompt assembly (base prompt + env block + memory + tmux/plan fragments) + prompt-injection threat scanner |
+| [`compaction.py`](../compaction.py) | Context-window management: cheap snip layer + LLM-driven summarization layer |
+| [`providers.py`](../providers.py) | Provider registry (`PROVIDERS` dict), auto-detection by model prefix, streaming adapters for Anthropic native + OpenAI-compatible APIs |
+| [`tool_registry.py`](../tool_registry.py) | Central `ToolDef` registry, dispatch, output truncation |
+| [`runtime.py`](../runtime.py) | `RuntimeContext` — per-session live state (callbacks, bridge flags, plan-mode state, streaming hooks). **Not** persisted. |
+| [`cc_config.py`](../cc_config.py) | Defaults + `~/.cheetahclaws/config.json` load/save.  Strips `_`-prefixed keys on save. |
+| [`quota.py`](../quota.py) | Per-session and daily token/cost budgets.  Checked before every API call. |
+| [`circuit_breaker.py`](../circuit_breaker.py) | Trip-open-after-N-failures protection around provider calls. |
+| [`error_classifier.py`](../error_classifier.py) | Categorize API errors (rate limit / context-too-long / network / transient) so `agent.run()` can pick the right retry strategy. |
+| [`logging_utils.py`](../logging_utils.py) | Structured logging facade (info/warn/error with kwargs).  Configured from `config["log_level"]` / `config["log_file"]`. |
+| [`session_store.py`](../session_store.py) | On-disk session history (daily rotation + cap) and `session_latest.json` for `/resume`. |
+| [`jobs.py`](../jobs.py) | Background job bookkeeping used by `/worker` and subscription runs. |
+| [`health.py`](../health.py) | Optional HTTP health endpoint started by bootstrap when `health_check_port` is set. |
+| [`tmux_tools.py`](../tmux_tools.py) | Tmux `TmuxNewSession` / `TmuxSendKeys` / … tool definitions (register at import). |
+| [`auxiliary.py`](../auxiliary.py) | Small helper(s) for an "auxiliary" cheap model (used for compaction summaries and the like). |
+
+### 2. Packages
+
+Each directory is a coherent feature or subsystem with its own
+internal structure.
+
+| Package | What it owns |
+|---|---|
+| [`tools/`](../tools) | All built-in LLM-callable tools.  `tools/__init__.py` holds `TOOL_SCHEMAS`, calls `_register_builtins()`, and imports extension modules.  One file per category: `fs.py`, `shell.py`, `web.py`, `notebook.py`, `diagnostics.py`, `security.py`, `interaction.py`, plus optional `browser.py`, `email.py`, `files.py`. |
+| [`commands/`](../commands) | Slash-command handlers.  `core.py` (help/clear/context/cost/…), `config_cmd.py` (model/config/permissions), `session.py` (save/load/resume), `advanced.py` (brainstorm/worker/ssj/memory/agents/skills/mcp/plugin/tasks), `checkpoint_plan.py` (checkpoint/rewind/plan), `agent_cmd.py` (/agent), `monitor_cmd.py` (subscribe/monitor). |
+| [`bridges/`](../bridges) | External messaging adapters: `telegram.py`, `wechat.py`, `slack.py`, plus shared `interactive_session.py` and `terminal_runner.py`. |
+| [`ui/`](../ui) | Terminal rendering — `input.py` (prompt_toolkit / readline), `render.py` (rich Markdown, ANSI helpers, spinners, status line). |
+| [`web/`](../web) | Optional self-hosted web UI (FastAPI-style — xterm.js frontend, SQLite session store, per-user auth).  Enabled by `[web]` extra. |
+| [`memory/`](../memory) | Persistent memory across sessions — `store.py` (CRUD), `scan.py`/`context.py` (index + freshness), `consolidator.py` (`/memory consolidate`), `tools.py` (`MemorySave` / `MemoryDelete` / `MemorySearch` / `MemoryList`). |
+| [`multi_agent/`](../multi_agent) | Sub-agent subsystem.  `subagent.py` owns `SubAgentManager` (ThreadPoolExecutor), depth gating, git-worktree isolation; `tools.py` exposes `Agent` / `SendMessage` / `CheckAgentResult` / `ListAgentTasks` / `ListAgentTypes`. |
+| [`skill/`](../skill) | Markdown-based skill templates — `loader.py` parses frontmatter + resolves project→user→built-in precedence, `executor.py` runs a skill inline or in a fork, `builtin.py` ships a few default skills, `tools.py` exposes `Skill` / `SkillList`. |
+| [`cc_mcp/`](../cc_mcp) | MCP (Model Context Protocol) client — `config.py` loads `.mcp.json`, `client.py` speaks stdio/SSE/HTTP JSON-RPC, `tools.py` connects servers and registers each remote tool as `mcp__<server>__<tool>`.  Renamed from `mcp/` to avoid stdlib collision. |
+| [`task/`](../task) | In-session task list — `types.py` (model + status enum), `store.py` (thread-safe CRUD + dependency-edge maintenance), `tools.py` (`TaskCreate` / `TaskUpdate` / `TaskGet` / `TaskList`). |
+| [`checkpoint/`](../checkpoint) | Auto-snapshot of conversation + file state after every turn.  `types.py` data models, `store.py` backup + rewind, `hooks.py` monkey-patches `Write` / `Edit` / `NotebookEdit` to snapshot pre-edit.  Command wiring in `commands/checkpoint_plan.py`. |
+| [`plugin/`](../plugin) | Plugin install / enable / disable / update from git URLs or local paths.  `loader.py` imports user plugins and registers their `TOOL_DEFS` / `COMMAND_DEFS`; `recommend.py` scores plugin marketplace by keyword/tag match. |
+| [`monitor/`](../monitor) | AI-monitored topic subscriptions — `fetchers.py` (arxiv / stocks / crypto / news), `summarizer.py` (LLM-based), `scheduler.py` (cron-ish), `notifier.py` (Telegram/Slack/stdout), `store.py` (subscription state). |
+| [`modular/`](../modular) | Auto-discovered optional feature modules.  Each subdir exposes `cmd.py::COMMAND_DEFS` and/or `tools.py::TOOL_DEFS`; `modular/__init__.py::load_all_commands` picks them up at startup.  Ships with `modular/voice/`, `modular/video/`, `modular/trading/`. |
+
+### 3. Backward-compat shims
+
+A few root `.py` files now just re-export from the moved package.  They
+exist because third-party plugin code and some legacy imports still
+reference them.  **Edit the underlying package; keep the shim public
+surface stable.**
+
+| Shim | Re-exports from |
+|---|---|
+| [`memory.py`](../memory.py) | `memory/` package |
+| [`skills.py`](../skills.py) | `skill/` package |
+| [`subagent.py`](../subagent.py) | `multi_agent/subagent` module |
+
+---
+
+## Core subsystems in depth
+
+### Tool registry
+
+Every LLM-callable capability is a `ToolDef` entered into a single
+process-wide registry.
 
 ```python
+# tool_registry.py
 @dataclass
 class ToolDef:
     name: str               # unique identifier (e.g. "Read", "MemorySave")
     schema: dict            # JSON schema sent to the LLM API
     func: Callable          # (params: dict, config: dict) -> str
-    read_only: bool         # True = auto-approve in 'auto' permission mode
-    concurrent_safe: bool   # True = safe to run in parallel (for sub-agents)
+    read_only: bool         # auto-approved in 'auto' permission mode
+    concurrent_safe: bool   # safe to run in parallel with others in a turn
 ```
 
-**Public API:**
+**Five registration paths** all feed the same registry:
 
-| Function | Description |
-|---|---|
-| `register_tool(tool_def)` | Add a tool to the registry (overwrites by name) |
-| `get_tool(name)` | Look up by name, returns `None` if not found |
-| `get_all_tools()` | List all registered tools |
-| `get_tool_schemas()` | Return schemas for API calls |
-| `execute_tool(name, params, config, max_output=32000)` | Execute with output truncation |
-| `clear_registry()` | Reset — for testing only |
+1. **Built-ins** — `tools/__init__.py::_register_builtins()` runs at
+   module import.  Registers 13+ core tools (Read, Write, Edit, Bash,
+   Glob, Grep, WebFetch, WebSearch, NotebookEdit, GetDiagnostics,
+   AskUserQuestion, SleepTimer, plus `EnterPlanMode` / `ExitPlanMode`
+   at the bottom of the file).
+2. **Extension packages** — a `_EXTENSION_MODULES` list in
+   `tools/__init__.py` (`memory.tools`, `multi_agent.tools`,
+   `skill.tools`, `cc_mcp.tools`, `task.tools`) is imported for side
+   effects; each module calls `register_tool()` at its own import time.
+   Failures are swallowed (extensions are best-effort).
+3. **Plugins** — user-installed packages expose a `TOOL_DEFS` list; the
+   loader in `plugin/loader.py::register_plugin_tools()` iterates and
+   registers.  **Plugin code must not call `register_tool()` directly.**
+4. **Modular ecosystem** — `modular/<name>/tools.py::TOOL_DEFS`
+   collected via `modular.load_all_tools()`.  Auto-discovered, no
+   wiring required.
+5. **Checkpoint hooks** — `checkpoint/hooks.py::install_hooks()`
+   monkey-patches the already-registered Write / Edit / NotebookEdit
+   tools so each mutation snapshots the pre-state.  Runs *after*
+   `_register_builtins()` at the bottom of `tools/__init__.py`;
+   ordering matters.
 
-**Output truncation:** If a tool returns more than `max_output` chars, the result is
-truncated to `first_half + [... N chars truncated ...] + last_quarter`. This prevents
-a single tool call (e.g. reading a huge file) from blowing up the context window.
+**Output truncation** — `execute_tool(name, params, config, max_output)`
+truncates any result larger than `max_output` (default 32 000 chars)
+to `first_half + "[... N chars truncated ...]" + last_quarter`.  This
+is the first line of defense against a runaway tool blowing up context.
 
-**Registering a custom tool:**
+### Agent loop
 
-```python
-from tool_registry import ToolDef, register_tool
-
-def my_tool(params, config):
-    return f"Hello, {params['name']}!"
-
-register_tool(ToolDef(
-    name="MyTool",
-    schema={
-        "name": "MyTool",
-        "description": "A greeting tool",
-        "input_schema": {
-            "type": "object",
-            "properties": {"name": {"type": "string"}},
-            "required": ["name"],
-        },
-    },
-    func=my_tool,
-    read_only=True,
-    concurrent_safe=True,
-))
-```
-
-### `tools.py` — Built-in Tool Implementations
-
-Contains the 8 core tools (Read, Write, Edit, Bash, Glob, Grep, WebFetch, WebSearch)
-plus memory tools (MemorySave, MemoryDelete) and sub-agent tools (Agent, CheckAgentResult,
-ListAgentTasks). All register themselves via `tool_registry` at import time.
-
-**Key internals:**
-
-- `_is_safe_bash(cmd)` — whitelist of safe shell commands for auto-approval
-- `generate_unified_diff(old, new, filename)` — diff generation for Edit/Write
-- `maybe_truncate_diff(diff_text, max_lines=80)` — truncate large diffs for display
-- `_get_agent_manager()` — lazy singleton for SubAgentManager
-- Backward-compatible `execute_tool(name, inputs, permission_mode, ask_permission)` wrapper
-
-### `agent.py` — Core Agent Loop
-
-The heart of the system. `run()` is a generator that yields events as they happen.
-
-```python
-def run(user_message, state, config, system_prompt,
-        depth=0, cancel_check=None) -> Generator:
-```
-
-**Loop logic:**
+`agent.run(user_message, state, config, system_prompt, depth,
+cancel_check) -> Generator` is the core multi-turn loop.  Callers
+consume the event stream; nothing else drives the model.
 
 ```
-1. Append user message
-2. Inject depth into config (for sub-agent depth tracking)
-3. While True:
-   a. Check cancel_check() — cooperative cancellation for sub-agents
-   b. maybe_compact(state, config) — compress if near context limit
-   c. sanitize_history(state.messages) — enforce tool_calls ↔ tool-response pairing
-   d. Stream from provider → yield TextChunk / ThinkingChunk
-   e. Record assistant message
-   f. If no tool_calls → break
-   g. For each tool_call:
-      - Permission check (_check_permission)
-      - If denied → yield PermissionRequest → user decides
-      - Execute tool → yield ToolStart / ToolEnd
-      - Append tool result
-   h. Loop (model sees tool results and responds)
+1. Append user message (possibly attach pending image)
+2. Inject transient keys into config: _depth, _system_prompt
+3. Loop:
+   a. If cancel_check() → return
+   b. maybe_compact(state, config)    # snip → summarize if still big
+   c. sanitize_history(state.messages) # enforce tool_calls ↔ tool-response pairing
+   d. Quota check                      # raise [Quota exceeded] and break
+   e. Stream from provider, retrying up to 3× on retryable errors:
+        TextChunk / ThinkingChunk → yield to caller
+        AssistantTurn             → capture
+   f. Record assistant turn in state.messages
+   g. yield TurnDone(in_tokens, out_tokens)
+   h. If no tool_calls → break
+   i. Permission gate each tool_call (sequential — may prompt user)
+   j. Execute:
+        - parallel batch for concurrent_safe tools when >1 in a turn
+        - sequential batch for everything else
+   k. yield ToolEnd(name, result, permitted) in original order
+   l. Append each tool result to state.messages, loop back to step 3d
 ```
 
-**Event types:**
+**Event types** the caller sees:
 
 | Event | Fields | When |
 |---|---|---|
 | `TextChunk` | `text` | Streaming text delta |
-| `ThinkingChunk` | `text` | Extended thinking block |
-| `ToolStart` | `name, inputs` | Before tool execution |
-| `ToolEnd` | `name, result, permitted` | After tool execution |
-| `PermissionRequest` | `description, granted` | Needs user approval |
-| `TurnDone` | `input_tokens, output_tokens` | End of one API turn |
+| `ThinkingChunk` | `text` | Extended thinking (Claude) or reasoning stream (o1/o3/deepseek-r1) |
+| `ToolStart` | `name, inputs` | Just before a tool is invoked |
+| `ToolEnd` | `name, result, permitted` | After tool completes (or was denied) |
+| `PermissionRequest` | `description, granted` | Needs user approval; caller sets `.granted` |
+| `TurnDone` | `input_tokens, output_tokens` | End of one API call |
 
 **Session-level token totals** live on `AgentState`, not on the per-turn event:
 
 | Field | Source |
 |---|---|
 | `total_input_tokens` / `total_output_tokens` | Summed from each turn's `in_tokens` / `out_tokens` |
-| `total_cache_read_tokens` / `total_cache_write_tokens` | Summed from each turn's `cache_read_tokens` / `cache_write_tokens` via `getattr(..., 0)`. Anthropic populates both; OpenAI-schema providers populate read-only (their spec has no cache-write counter); Ollama and custom providers default to 0 |
+| `total_cache_read_tokens` / `total_cache_write_tokens` | Summed from each turn's `cache_read_tokens` / `cache_write_tokens` via `getattr(..., 0)`. Anthropic populates both; OpenAI-schema providers populate read-only (their spec has no cache-write counter); Ollama and custom providers default to 0. |
 
-All four totals are persisted into `checkpoint/store.make_snapshot`'s `token_snapshot` dict and restored as a set on `/checkpoint <id>` / `/rewind`, so rewind never leaves the running counters out of sync with the snapshot they were rewound to.
+All four totals are persisted into `checkpoint/store.make_snapshot`'s `token_snapshot` dict and restored on `/checkpoint <id>` / `/rewind`, so rewind never leaves the running counters out of sync with the snapshot they were rewound to.
 
-### `compaction.py` — Context Window Management
+Error handling is classified (`error_classifier.classify`) into
+`retryable / context-too-long / auth / network / unknown`.  Retryable
+errors back off exponentially (bounded to 30 s); context-too-long
+triggers a forced compaction mid-turn; circuit-open errors short-circuit
+to avoid hammering a failing provider.
 
-Keeps conversations within model context limits using two layers, plus a
-history-integrity sanitizer that runs before every API call.
+### Provider abstraction
 
-**Layer 1: Snip** (`snip_old_tool_results`)
-- Rule-based, no API cost
-- Truncates tool-role messages older than `preserve_last_n_turns` (default 6)
-- Keeps first half + last quarter of the content
-
-**Layer 2: Auto-Compact** (`compact_messages`)
-- Model-driven: calls the current model to summarize old messages
-- Splits messages into [old | recent] at ~70/30 ratio
-- Replaces old messages with a summary + acknowledgment
-
-**Tool-pair-aware splitting** (`_respect_tool_pairs`)
-- `find_split_point` chooses an index by token count, then adjusts it so the
-  split never falls **between** an `assistant(tool_calls)` message and its
-  `tool` response messages.
-- Without this, the recent half would contain orphan `tool` entries which
-  OpenAI-compatible providers (DeepSeek et al.) reject with
-  `"Messages with role 'tool' must be a response to a preceding message with 'tool_calls'"` (HTTP 400).
-- If no safe split exists, returns `0` (skip compaction this turn).
-
-**History sanitizer** (`sanitize_history`)
-- Single-pass O(n) invariant enforcer, returns a new list; does not mutate input.
-- Drops orphan `tool` messages (tool_call_id not in the current assistant's `tool_calls`).
-- Strips unanswered `tool_calls` entries from assistant messages when a non-tool
-  message intervenes; removes the `tool_calls` key entirely if all are stripped.
-- Called from `agent.run()` after `maybe_compact` and before every `stream()`,
-  so any source of inconsistency (compaction artifacts, crashed tool execs,
-  checkpoint restores) is neutralized before it reaches the provider.
-
-**Trigger:** `maybe_compact()` checks `estimate_tokens(messages) > context_limit * 0.7`.
-Runs snip first (cheap), then auto-compact if still over.
-
-**Token estimation:** `int((chars / 2.8) + 4 tokens/msg) * 1.1` — chars/2.8 is
-conservative for code-heavy content (plain `/3.5` under-counted and let context
-overflow), plus per-message framing overhead and a 10% buffer. Tool-call `input`
-dicts are counted recursively so nested payloads (e.g. `Write.content`) contribute.
-`get_context_limit(model)` reads from the provider registry.
-
-### `memory.py` — Persistent Memory
-
-File-based memory system stored in `~/.cheetahclaws/memory/`.
-
-**Storage format:**
-
-```
-~/.cheetahclaws/memory/
-├── MEMORY.md              # Index: one line per memory
-├── user_preferences.md    # Individual memory file
-└── project_auth.md
-```
-
-Each memory file uses markdown with YAML frontmatter:
-
-```markdown
----
-name: user preferences
-description: coding style preferences
-type: feedback
-created: 2026-04-02
----
-
-User prefers 4-space indentation and type hints.
-```
-
-**How it integrates:**
-- `get_memory_context()` returns the MEMORY.md index text
-- `context.py` injects this into the system prompt
-- The model reads the index, then uses `Read` tool to access full memory content
-- The model uses `MemorySave` / `MemoryDelete` tools to manage memories
-
-### `subagent.py` — Threaded Sub-Agents
-
-Sub-agents run in background threads via `ThreadPoolExecutor`.
-
-**Key design decisions:**
-
-1. **Fresh context** — each sub-agent starts with empty message history + task prompt
-2. **Depth limiting** — `max_depth=3`, checked at spawn time. Model gets an error message
-   (not silent tool removal) so it can adapt.
-3. **Cooperative cancellation** — `cancel_check` callable checked each loop iteration.
-   Python threads can't be killed safely, so we set a flag.
-4. **Threading, not asyncio** — the entire codebase is synchronous generators. Threading
-   via `concurrent.futures` keeps things simple. The SubAgentManager API is designed to
-   be compatible with a future async migration.
-
-**Lifecycle:**
-
-```
-spawn(prompt, config, system_prompt, depth)
-  → Creates SubAgentTask
-  → Submits _run to ThreadPoolExecutor
-  → _run calls agent.run() with depth+1
-
-wait(task_id, timeout)  → blocks until complete
-cancel(task_id)         → sets _cancel_flag
-get_result(task_id)     → returns result string
-```
-
-### `skills.py` — Reusable Prompt Templates
-
-Skills are markdown files with frontmatter. They are **not code** — just structured prompts
-that get injected into the agent loop.
-
-**Skill file format:**
-
-```markdown
----
-name: commit
-description: Create a conventional commit
-triggers: ["/commit"]
-tools: [Bash, Read]
----
-
-Your prompt instructions here...
-```
-
-**Execution:** `execute_skill()` wraps the skill prompt as a user message and calls
-`agent.run()`. The skill runs through the exact same agent loop as a normal query.
-
-**Search order:** Project-level (`./.cheetahclaws/skills/`) overrides user-level
-(`~/.cheetahclaws/skills/`) when skill names collide.
-
-### `providers.py` — Multi-Provider Abstraction
-
-Two streaming adapters cover all providers:
-
-| Adapter | Providers |
-|---|---|
-| `stream_anthropic()` | Anthropic (native SDK) |
-| `stream_openai_compat()` | OpenAI, Gemini, Kimi, Qwen, Zhipu, DeepSeek, Ollama, LM Studio, Custom |
-
-**Neutral message format** (provider-independent):
+`providers.py` keeps a `PROVIDERS` dict of provider metadata (API key
+env var, base URL, context limit, known model IDs, per-provider
+`max_completion_tokens` cap).  `detect_provider(model_id)` auto-routes
+based on the model string:
 
 ```python
-{"role": "user", "content": "..."}
-{"role": "assistant", "content": "...", "tool_calls": [{"id": "...", "name": "...", "input": {...}}]}
-{"role": "tool", "tool_call_id": "...", "name": "...", "content": "..."}
+# Illustrative (not exhaustive)
+"claude-opus-4-7"        → anthropic
+"gpt-5"                  → openai
+"gemini-3.1-pro-preview" → gemini
+"qwen/Qwen3-MAX"         → qwen
+"ollama/qwen2.5-coder"   → ollama  (explicit prefix)
+"custom/my-endpoint"     → custom
 ```
 
-Conversion functions: `messages_to_anthropic()`, `messages_to_openai()`, `tools_to_openai()`.
+`stream(model, system, messages, tool_schemas, config) -> Generator`
+is the one entry point agent.py uses.  Internally it dispatches to
+`stream_anthropic()` (native SDK) or `stream_openai_compat()` (used by
+every OpenAI-compatible provider).
 
-**Provider-specific handling:**
-- Gemini 3 models require `thought_signature` in tool call responses — this is transparently
-  captured and passed through via `extra_content` on tool_call dicts.
+**Neutral message format** — the single internal contract agent.py,
+providers.py, compaction.py, and session_store.py all agree on:
 
-### `context.py` — System Prompt Builder
+```python
+{"role": "user",      "content": "...", "images": [...]?}
+{"role": "assistant", "content": "...", "tool_calls": [{"id", "name", "input", "extra_content"?}]}
+{"role": "tool",      "tool_call_id": "...", "name": "...", "content": "..."}
+```
 
-Assembles the system prompt from:
-1. Base template (role, date, cwd, platform)
-2. Git info (branch, status, recent commits)
-3. CLAUDE.md content (project-level + global)
-4. Memory index (from `memory.get_memory_context()`)
+Adapter functions `messages_to_anthropic()` and `messages_to_openai()`
+convert bidirectionally.  **Preserve tool_call IDs exactly** — some
+providers are strict.  Gemini 3 additionally requires an opaque
+`thought_signature` round-tripped on every tool_call; this is carried
+transparently through `extra_content`.
 
-### `config.py` — Configuration
+### Context (system prompt) assembly
 
-Defaults stored in `~/.cheetahclaws/config.json`. Key settings:
+`context.build_system_prompt(config)` is the only public entry point.
+It renders a single `SYSTEM_PROMPT_TEMPLATE` string and conditionally
+appends dynamic blocks:
 
-| Key | Default | Description |
-|---|---|---|
-| `model` | `claude-opus-4-6` | Active model |
-| `max_tokens` | `8192` | Max output tokens |
-| `permission_mode` | `auto` | Permission mode |
-| `max_tool_output` | `32000` | Tool output truncation limit |
-| `max_agent_depth` | `3` | Max sub-agent nesting |
-| `max_concurrent_agents` | `3` | Thread pool size |
+```
+SYSTEM_PROMPT_TEMPLATE.format(
+    date, cwd, platform, platform_hints,
+    git_info,         # from get_git_info()
+    claude_md,        # from get_claude_md() — walked up from cwd + global
+)
++ memory index        # from memory.get_memory_context(), if non-empty
++ tmux block          # large literal string, if tmux_available()
++ plan-mode block     # if config["permission_mode"] == "plan"
+```
+
+All provider models see the same base template today; per-provider
+differentiation is tracked as a separate initiative.  The template and
+the tmux / plan literal strings all live in
+[`context.py`](../context.py) at roughly ~200 lines total.
+
+`context.py` also runs a regex scan on any CLAUDE.md content before
+inclusion — patterns like "ignore previous instructions", "you are
+now…", or shell commands dereferencing `$ANTHROPIC_API_KEY` are
+flagged and the file is excluded with a warning to stderr.  This is
+best-effort, not a security boundary.
+
+### Compaction
+
+Two layers, applied in order only when needed.
+
+**Layer 1 — snip** (`snip_old_tool_results`):
+
+- Rule-based, no API cost.
+- Truncates tool-role messages older than `preserve_last_n_turns`
+  (default 6) to first-half + last-quarter.
+- Run unconditionally before each streaming call.
+
+**Layer 2 — auto-compact** (`compact_messages`):
+
+- LLM-driven: calls the current model (or an auxiliary cheaper model
+  via `auxiliary.py`) to summarize old turns.
+- Splits messages into `[old | recent]` roughly at the 70/30 mark by
+  token count, replaces `old` with a summary + acknowledgement turn.
+- Preserves the plan-mode plan file content across compactions
+  (`_restore_plan_context`).
+
+**Trigger** — `maybe_compact(state, config)` fires when
+`estimate_tokens(messages) > context_limit * 0.7`.  The model's
+context limit is read from `providers.PROVIDERS[provider]["context_limit"]`.
+
+Token estimation is a crude `len(text) / 3.5`.  Good enough for the
+threshold decision; the SDK returns real counts after each call for
+billing/quota.
+
+### Permission model
+
+Four modes, set by `config["permission_mode"]` and checked in
+`agent.py::_check_permission`:
+
+| Mode | Reads | Writes | Bash (unsafe) | Plan-file write |
+|---|---|---|---|---|
+| `auto` (default) | auto-approved | prompt | prompt | n/a |
+| `accept-all` | auto | auto | auto | n/a |
+| `manual` | prompt | prompt | prompt | prompt |
+| `plan` | auto | **blocked** | _is_safe_bash only | auto-approved |
+
+`EnterPlanMode` and `ExitPlanMode` are always auto-approved so the
+model can enter/exit plan mode without interactive friction.
+
+Plus two security layers that apply regardless of mode:
+
+- **`allowed_root`** (`cc_config.py` default `None`) — if set to a
+  path, restricts file tools (Read / Write / Edit / Glob / Grep) to
+  that subtree.  Null means unrestricted (CLI default).
+- **`shell_policy`** — `allow` (default) / `log` / `deny` for the
+  Bash tool.
+
+### Parallel tool execution
+
+When an assistant turn produces more than one tool call, `agent.run()`
+batches them:
+
+- **Parallel batch** — tool calls where `ToolDef.concurrent_safe=True`
+  AND the turn has >1 call; run via a `ThreadPoolExecutor(max_workers=8)`.
+- **Sequential batch** — everything else, one at a time.
+
+Permission-denied calls always go to the sequential batch so the model
+gets a consistent "denied" result.  Yielded `ToolEnd` events preserve
+the **original tool_call order**, not the completion order, so the
+assistant sees results in the order it asked for them.
+
+Mark `concurrent_safe=False` for anything touching shared mutable
+state (files, process spawn, bridge sockets, global registries).
 
 ---
 
-## Data Flow Example
+## Cross-cutting services
 
-A user asks "Read config.py and change max_tokens to 16384":
+### Quota
+
+`quota.py` checks a per-session and per-day budget before every API
+call and records usage after.  Budgets are:
+
+- `session_token_budget`, `session_cost_budget` — per `_session_id`.
+- `daily_token_budget`, `daily_cost_budget` — aggregated across all
+  sessions for today.
+
+All four default to `None` (unlimited) in `cc_config.DEFAULTS`.  When
+exceeded, `agent.run()` yields a `TextChunk("[Quota exceeded — …]")`
+and breaks the loop.  Long-running / autonomous workflows should turn
+these on.
+
+### Circuit breaker
+
+`circuit_breaker.py` tracks consecutive failures against a provider.
+After `circuit_failure_threshold` failures within
+`circuit_window_seconds`, the circuit opens for
+`circuit_cooldown_seconds`; calls during the cooldown raise
+`CircuitOpenError` which the agent loop surfaces as
+`[Circuit open — …]` rather than hammering a failing endpoint.
+
+### Error classification
+
+`error_classifier.classify(exc)` returns a `ClassifiedError` with:
+
+- `category` (rate_limit / context_too_long / auth / network / transient / unknown)
+- `retryable: bool`
+- `should_compress: bool` — true for context-too-long; triggers a
+  forced compaction mid-turn.
+- `backoff_multiplier: float` — scales the exponential backoff.
+- `hint: str | None` — actionable message (e.g. "check OPENAI_API_KEY").
+
+### Logging
+
+`logging_utils.py` is a thin structured-logging facade:
+
+```python
+import logging_utils as _log
+_log.info("tool_start", session_id="abc", tool="Read", input_keys=["file_path"])
+```
+
+Configured by `configure_from_config(config)` during bootstrap.
+Output goes to stderr by default; set `config["log_file"]` to persist.
+Levels: `off` / `error` / `warn` / `info` / `debug`.  Default `warn`
+to keep the interactive CLI quiet.
+
+### Session persistence
+
+`session_store.py` writes on `/exit`, `/quit`, Ctrl+C, and Ctrl+D:
+
+- `~/.cheetahclaws/sessions/daily/YYYY-MM-DD/session_<ts>.json`
+  (capped by `session_daily_limit`).
+- `~/.cheetahclaws/sessions/history.json` (capped by
+  `session_history_limit`).
+- `~/.cheetahclaws/sessions/mr_sessions/session_latest.json` for
+  `/resume`.
+
+The web UI (`web/`) uses its own SQLite store (`web/db.py`) for
+multi-user history; the two don't share state today.
+
+---
+
+## REPL and slash commands
+
+`cheetahclaws.py::main()` runs the CLI, parses args, calls
+`bootstrap(config)`, then enters `repl(config, initial_prompt)`.
+
+The REPL loop:
+
+1. Read input (via `ui.input.read_input` — prompt_toolkit when
+   available, else readline).
+2. If it starts with `/`, dispatch via the `COMMANDS` dict.
+3. Otherwise, call `agent.run()` and render the event stream with
+   `ui.render`.
+4. After every turn, run checkpoint snapshot (throttled).
+5. Handle Ctrl+C (3× within 2 s triggers `os._exit(1)` to escape
+   stuck I/O).
+
+`COMMANDS` is a flat `{name: callable}` dict built in
+`cheetahclaws.py` by importing every `cmd_*` from `commands/*.py`.
+Plugins and `modular/` modules can contribute additional entries via
+`_load_external_commands_into(COMMANDS)`.
+
+---
+
+## Feature subsystems
+
+### Sub-agents (`multi_agent/`)
+
+`SubAgentManager` owns a `concurrent.futures.ThreadPoolExecutor`
+(default 3 workers).  Each spawned sub-agent:
+
+- Starts with **fresh message history** + task prompt.
+- Runs `agent.run()` with `depth + 1`.
+- Optionally creates an isolated **git worktree** (`isolation="worktree"`)
+  on a short-lived branch for parallel file edits without conflicts.
+- Is cancelled **cooperatively** — Python threads can't be killed
+  safely, so `cancel(task_id)` sets a flag checked at the top of each
+  loop iteration.
+
+Depth is bounded at 3 (`max_agent_depth`) and checked at `spawn` time;
+the model gets an error string rather than a silently-removed tool so
+it can adjust strategy.
+
+Agent *types* are loaded from `~/.cheetahclaws/agents/<name>.md`
+(Markdown with YAML frontmatter: `model`, `tools`, extra system
+prompt).  Five built-ins: `general-purpose`, `coder`, `reviewer`,
+`researcher`, `tester`.
+
+### Plan mode (`commands/checkpoint_plan.py` + `tools/__init__.py`)
+
+`/plan <desc>` sets `config["permission_mode"] = "plan"` and creates a
+plan file at `.nano_claude/plans/<session_id>.md`.  The only write the
+model can perform in this mode is to that file; everything else
+returns a `[Plan mode]` message explaining the restriction.
+
+Two agent-callable tools — `EnterPlanMode` and `ExitPlanMode` — let
+the model enter/exit plan mode autonomously on complex requests.
+`ExitPlanMode` refuses to exit if the plan file is empty, forcing the
+model to actually write the plan before resuming normal permissions.
+
+**The historical path `.nano_claude/plans/…` is intentional** (dates
+from when the project was called "Nano Claude Code").  Don't rename
+without updating plan mode code.
+
+### Checkpoint (`checkpoint/`)
+
+After every turn, `checkpoint/store.py` captures:
+
+- A post-edit copy of every file the turn modified.
+- A full snapshot of the conversation state.
+
+100-snapshot sliding window per session.  `/checkpoint <id>` or
+`/rewind <id>` atomically restores both files **and** message history
+to that point.  Instrumented by `checkpoint/hooks.py::install_hooks`
+which wraps the Write / Edit / NotebookEdit tool functions
+post-registration.
+
+### Memory (`memory/`)
+
+Dual-scope file-based store:
+
+- User scope — `~/.cheetahclaws/memory/<slug>.md` (shared).
+- Project scope — `.cheetahclaws/memory/<slug>.md` (per cwd).
+
+Each memory is a Markdown file with YAML frontmatter (`name`,
+`description`, `type` ∈ `{user, feedback, project, reference}`,
+`confidence`, `source`, `last_used_at`, `conflict_group`).  Index
+files (`MEMORY.md`) are auto-maintained and injected into every system
+prompt.
+
+`MemorySearch` re-ranks results by `confidence × 30-day recency
+decay` and refreshes `last_used_at` on hits.  `/memory consolidate`
+runs a cheap LLM pass over the current session and saves up to 3
+high-confidence insights without overwriting higher-confidence user
+entries.
+
+### MCP (`cc_mcp/`)
+
+Standard MCP client.  Supports stdio (subprocess), SSE, and
+streamable HTTP transports.  `.mcp.json` in the project root or
+`~/.cheetahclaws/mcp.json` (user scope) lists servers; `/mcp reload`
+reconnects.  Every discovered remote tool is registered as
+`mcp__<server>__<tool>` and participates in the normal permission /
+execution flow.
+
+Renamed from `mcp/` to `cc_mcp/` to avoid import-time collision with
+Python's stdlib namespace and the `modelcontextprotocol` package.
+**Import from `cc_mcp`, not `mcp`.**
+
+### Tasks (`task/`)
+
+Structured in-session task list with a dependency graph.
+`TaskCreate` / `TaskUpdate` support `add_blocks` / `add_blocked_by`
+edges; `TaskList` formats remaining blockers for each open task.
+Persisted to `.cheetahclaws/tasks.json` per cwd.
+
+Distinct from `TodoWrite` in other coding agents — CheetahClaws
+tasks have **IDs, statuses (`pending / in_progress / completed /
+cancelled / deleted`), owners, metadata, and dependencies**, not a
+flat checkbox list.
+
+### Skills (`skill/`)
+
+Markdown-with-frontmatter prompt templates.  `Skill(name, args)`
+loads the file, substitutes `$ARGUMENTS`, and either runs the prompt
+inline in the current session or forks a sub-agent.  Precedence:
+project `.cheetahclaws/skills/` → user `~/.cheetahclaws/skills/` →
+built-in (`skill/builtin.py`).  Two built-ins ship: `/commit` and
+`/review`.
+
+### Plugins (`plugin/`)
+
+`/plugin install <name>@<git-url-or-local-path>` clones the plugin,
+reads `plugin.json` (or `PLUGIN.md` with YAML frontmatter), and
+registers declared `tools` / `skills` / `commands` / `mcp_servers`.
+**Plugins export `TOOL_DEFS` / `COMMAND_DEFS` lists — they do not
+call `register_tool()` directly.**
+
+Scopes: user (`~/.cheetahclaws/plugins/`) and project
+(`.cheetahclaws/plugins/`).  `/plugin recommend [context]` scores the
+built-in marketplace by tag/keyword match.
+
+### Monitoring (`monitor/`)
+
+`/subscribe <topic> [schedule]` registers an AI-monitored topic:
+
+- `fetchers.py` talks to the topic source (arxiv, yfinance, CoinGecko,
+  RSS for news, or a custom search query).
+- `summarizer.py` asks the LLM to produce a readable summary.
+- `scheduler.py` runs subscriptions on cron-style intervals
+  (15m / hourly / daily / weekly).
+- `notifier.py` pushes the output to Telegram / Slack / console.
+- `store.py` holds subscription state.
+
+`/monitor start` launches the background scheduler; `/monitor run`
+executes all subscriptions once synchronously.
+
+### Bridges (`bridges/`)
+
+Each bridge wraps an incoming-message channel and hooks it into
+`RuntimeContext`:
+
+- `telegram.py` — Bot API long-polling, typing indicator, slash
+  passthrough.
+- `wechat.py` — iLink QR login, personal WeChat account.
+- `slack.py` — Web API polling of `conversations.history`, stdlib
+  `urllib` only (no `slack_sdk` dependency).
+
+Common pattern: set a thread-local flag on entry (`_is_in_tg_turn`),
+overwrite `RuntimeContext.tg_send` / `slack_send` / `wx_send`, route
+the incoming text to `runtime.ctx.run_query(...)`, then clear the
+flag.  `AskUserQuestion` and permission prompts use bridge-specific
+synchronous-input events (`tg_input_event` / `slack_input_event` /
+`wx_input_event`) to round-trip through the chat.
+
+### Autonomous agent runner (`agent_runner.py`)
+
+`/agent start <template> [args]` launches an autonomous loop that
+repeatedly calls `agent.run()` on a Markdown task program (from
+[`agent_templates/`](../agent_templates) or
+`~/.cheetahclaws/agent_templates/`).  Built-in templates:
+`auto_bug_fixer`, `auto_coder`, `paper_writer`, `research_assistant`,
+plus `modular/trading/agent_templates/trading_agent.md`.
+
+Per-iteration behavior:
+
+- Runs with `auto_approve=true` so permission prompts don't block.
+- Emits a ≤500-char summary via `send_fn` (bridge or stdout) after
+  each iteration.
+- Persists iteration records to
+  `~/.cheetahclaws/agents/<name>/log.jsonl`.
+- Wakes up on `stop_event.wait(interval)` — set `interval` small for
+  active monitoring, large for batch work.
+
+This is the closest thing the project has to a "7 × 24 agent"
+runtime today; see CONTRIBUTING.md for the current production-
+readiness gaps (daemon mode, SQLite session store, cost guardrails).
+
+### Modular ecosystem (`modular/`)
+
+Auto-discovered drop-in modules.  `modular/__init__.py::load_all_commands()`
+scans every subdir for `cmd.py::COMMAND_DEFS` and `tools.py::TOOL_DEFS`;
+found commands/tools are merged into `COMMANDS` / the tool registry
+with no explicit wiring.
+
+Ships with:
+
+- `modular/voice/` — recording (`sounddevice`/`arecord`/`sox`), STT
+  (`faster-whisper`/`openai-whisper`/OpenAI API), TTS generation.
+  Replaces the older top-level `voice/`.
+- `modular/video/` — story → TTS → images → subtitles → MP4 pipeline.
+- `modular/trading/` — multi-agent trading analysis (Bull/Bear debate
+  → risk panel → portfolio manager), BM25 memory over past trades,
+  four backtest strategies.
+
+### Web UI (`web/`)
+
+Optional self-hosted browser-accessible UI, enabled by `[web]` extra
+(`sqlalchemy`, `passlib[bcrypt]`, `PyJWT`).  `web/server.py` runs an
+HTTP server; `web/static/` serves an xterm.js frontend; `web/db.py`
+persists per-user session history in SQLite.  Launched by `/web` slash
+command inside the REPL, or by `cheetahclaws --serve` (TBD).
+
+---
+
+## Key architectural invariants
+
+These are the implicit rules the codebase holds itself to.  Breaking
+them is always a bug.
+
+### 1. `config` dict vs `RuntimeContext`
+
+`config` is a **serializable** dict loaded from
+`~/.cheetahclaws/config.json`.  It holds user settings (model,
+permission mode, API keys, budgets, log level).  `save_config()`
+strips any key starting with `_` before writing.
+
+`RuntimeContext` ([runtime.py](../runtime.py)) is **per-session live
+state** — threads, callbacks, bridge flags, plan-mode pointer,
+pending image, streaming hooks.  Keyed by `_session_id`, never
+persisted.
+
+```python
+# CORRECT
+import runtime
+sctx = runtime.get_ctx(config)
+sctx.plan_file = path
+
+# WRONG (this used to exist and was refactored out)
+config["_plan_file"] = path
+```
+
+The **only** `_`-prefixed key allowed in `config` is `_session_id` —
+the bridge between a config dict and its runtime context.  Transient
+per-turn keys (`_depth`, `_system_prompt`, `_worktree_cwd`) are
+injected by `agent.run()` into a local copy of config at call time
+and never persisted.
+
+### 2. Tool registration is the single extension point
+
+Everything the model can call ends up in
+`tool_registry._registry`.  This is how plugins, MCP servers, skills,
+feature packages, and the modular ecosystem all compose without
+knowing about each other.
+
+### 3. Neutral message format
+
+Every subsystem that handles conversation messages speaks the same
+format (see Provider abstraction above).  Providers adapt at the
+boundary, not in the middle of the pipeline.
+
+### 4. Bootstrap order
+
+`bootstrap.py` is the **one and only** place where startup side
+effects happen in a defined order: logging → tool registry → health
+server.  Don't add import-time side effects to top-level modules.
+New feature tools register via `_EXTENSION_MODULES` or the modular
+ecosystem, never by putting `register_tool()` in some module's
+top-level code that happens to get imported.
+
+### 5. Windows file-encoding discipline
+
+`tools/fs.py::_read` / `_write` / `_edit` force `encoding="utf-8"`
+and `newline=""`.  `_edit` additionally detects pure-CRLF files
+(every `\n` belongs to a `\r\n`) and restores the original line
+endings after the edit; mixed-ending files are left alone to avoid
+corruption.  Any new file-writing tool must mirror this.
+
+---
+
+## Data flow: end-to-end example
+
+User types `Read cc_config.py and change session_daily_limit to 20`
+with Claude as the active model.
 
 ```
-1. cheetahclaws.py captures input
-2. agent.run() appends user message, calls maybe_compact()
-3. providers.stream() sends to Gemini API with 13 tool schemas
-4. Model responds: text + tool_call[Read(config.py)]
-5. agent.py checks permission (Read = read_only → auto-approve)
-6. tool_registry.execute_tool("Read", ...) → file content (truncated if >32K)
-7. Tool result appended to messages, loop back to step 3
-8. Model responds: text + tool_call[Edit(config.py, "8192", "16384")]
-9. agent.py checks permission (Edit = not read_only → ask user)
-10. User approves → tools.py._edit() runs, generates diff
-11. cheetahclaws.py renders diff with ANSI colors (red/green)
-12. Tool result appended, loop back to step 3
-13. Model responds: "Done, max_tokens changed to 16384"
-14. No tool_calls → loop ends, TurnDone yielded
+ 1. cheetahclaws.py            reads line via ui.input
+ 2. repl()                     dispatches to agent.run()
+ 3. agent.run()                appends user message; config["_depth"]=0
+ 4. maybe_compact()            messages well under 70% limit — no-op
+ 5. quota.check_quota()        no budget set — pass
+ 6. providers.stream()         detects "claude-*" → stream_anthropic()
+ 7. context already built      system prompt includes anthropic.md + env
+ 8. Model responds:            "I'll read it first."
+                              + tool_call[Read(file_path=".../cc_config.py")]
+ 9. agent._check_permission    Read is read_only → auto-approve
+10. tool_registry.execute_tool Read via tools.fs._read → file content
+11. checkpoint hook: no-op     (Read doesn't mutate, no snapshot)
+12. agent yields ToolEnd;      appends tool message to state
+13. Loop back to providers.stream()
+14. Model responds:            "Changing 10 → 20"
+                              + tool_call[Edit(file_path=..., old="10", new="20")]
+15. agent._check_permission    Edit is not read_only, permission_mode=auto
+                              → PermissionRequest yielded
+16. cheetahclaws.py renders    prompt [y/N/a]; user types y → req.granted=True
+17. checkpoint hook fires      captures pre-edit file copy in snapshot dir
+18. tool_registry.execute_tool Edit runs, returns unified diff
+19. ui.render                  shows the diff in red/green
+20. Model responds:            "Done."   (no tool_calls)
+21. agent.run() breaks loop;   TurnDone yielded; REPL prints final text
+22. post-turn                  checkpoint.snapshot_session()
+                              session_store.save_latest()
 ```
 
 ---
@@ -355,52 +765,80 @@ A user asks "Read config.py and change max_tokens to 16384":
 ## Testing
 
 ```bash
-# Run all 78 tests
-python -m pytest tests/ -v
-
-# Run specific module tests
-python -m pytest tests/test_tool_registry.py -v
-python -m pytest tests/test_compaction.py -v
-python -m pytest tests/test_memory.py -v
-python -m pytest tests/test_subagent.py -v
-python -m pytest tests/test_skills.py -v
-python -m pytest tests/test_diff_view.py -v
+pip install -r requirements.txt && pip install pytest
+python -m pytest tests/ -x -q
 ```
 
-Tests use `monkeypatch` and `tmp_path` fixtures to avoid side effects.
-Sub-agent tests mock `_agent_run` to avoid real API calls.
+`[tool.pytest.ini_options]` sets `python_files = ["test_*.py",
+"e2e_*.py"]` — end-to-end tests are collected by default.  E2E tests
+may spawn subprocesses or touch the network; keep them
+self-contained.
+
+Test layout:
+
+- `test_<subsystem>.py` — unit tests for one package/module
+  (compaction, memory, subagent, mcp, plugin, task, skill, tool
+  registry, …).
+- `e2e_<scenario>.py` — integration tests (plan mode, compact, slash
+  commands, plan tools).
+- `tests/fixtures/` — golden prompt fixtures etc.
+
+Most tests use `monkeypatch` + `tmp_path` to avoid global state.
+Sub-agent tests mock `_agent_run` to avoid real API calls.  CI
+(`.github/workflows/ci.yml`) runs the suite on Python 3.10–3.13.
 
 ---
 
-## Future: Package Refactoring
+## Known gotchas
 
-When `tools.py` or `agent.py` grow too large, the flat layout can be migrated to:
+A collection of non-obvious traps; most bit someone at some point.
 
-```
-ncc/
-├── __init__.py
-├── repl.py              # from cheetahclaws.py
-├── agent/
-│   ├── loop.py          # from agent.py
-│   ├── subagent.py      # from subagent.py
-│   └── compaction.py    # from compaction.py
-├── providers/
-│   ├── base.py
-│   ├── openai_compat.py
-│   └── registry.py
-├── tools/
-│   ├── registry.py      # from tool_registry.py
-│   ├── builtin.py       # core 8 tools from tools.py
-│   ├── memory.py        # MemorySave/MemoryDelete from tools.py
-│   └── subagent.py      # Agent/Check/List from tools.py
-├── memory/
-│   └── store.py         # from memory.py
-├── skills/
-│   └── loader.py        # from skills.py
-└── config.py
-```
+- **Renamed modules**: `config.py` → `cc_config.py`; `mcp/` → `cc_mcp/`.
+  Rename was forced by stdlib / package namespace collisions.  Always
+  `import cc_config` / `from cc_mcp import ...`.
+- **`.nano_claude/plans/` vs `~/.cheetahclaws/`**: runtime state is
+  under `~/.cheetahclaws/` (underscore), but plan mode writes to
+  `.nano_claude/plans/<session>.md` in cwd.  The `.nano_claude` path
+  is historical (pre-rename) and intentional; don't "fix" it without
+  updating plan-mode code.
+- **py-modules discipline**: top-level `.py` files must be listed in
+  `pyproject.toml` `py-modules`, and packages in `packages`.  `pip
+  install .` silently drops anything not listed.  Backward-compat
+  shims (`memory.py`, `skills.py`, `subagent.py`) **are** listed — do
+  not delete them from `py-modules` without also deleting the shim.
+- **pytest picks up `e2e_*.py`**: some e2e tests depend on Unix-only
+  modules (`pty`, `termios`).  On Windows these collection errors are
+  pre-existing; skip them with `--ignore` until the project grows
+  Windows-compatible substitutes.
+- **Circuit breaker + quota**: every stream call is wrapped.  If you
+  see `[Quota exceeded]` or `[Circuit open]` in output, that's the
+  layer doing its job.  Don't bypass it; reset via `/circuit` or
+  check `config` budgets.
+- **Ollama 500 on non-tool-calling models**: some Ollama models
+  return HTTP 500 when `tools` are sent in the request.  Adapter
+  retries once without tools.  Tests in `tests/test_providers*` cover
+  the regression path.
+- **Gemini 3 `thought_signature`**: Gemini requires an opaque
+  signature echoed in every tool_call response.  It rides in
+  `extra_content` on tool_call dicts.  Any code path that reconstructs
+  tool calls (compaction, replay) must preserve it.
+- **Plugin tools registration**: plugin code declaring `TOOL_DEFS`
+  gets loaded through `plugin/loader.py::register_plugin_tools`.
+  Never call `register_tool()` directly in plugin code; the loader
+  handles resolution order and scoping.
 
-The current code is structured to make this migration straightforward:
-- Modules communicate via function parameters, not globals
-- Each module has a small public API surface
-- Dependencies are unidirectional
+---
+
+## Related docs
+
+- [CONTRIBUTING.md](../CONTRIBUTING.md) — quick start, "where to add
+  things", PR checklist.  Practical, short, kept current.
+- [README.md](../README.md) — user-facing surface (CLI flags, slash
+  commands, provider setup, memory / plugin / skill walkthroughs).
+- [docs/contributor_guide.md](contributor_guide.md) — older "where to
+  edit what" reference.  Partially overlapping with CONTRIBUTING.md;
+  may be folded in over time.
+- [docs/guides/extensions.md](guides/extensions.md) — user-level
+  docs for memory / skills / sub-agents / MCP / plugins.
+- [docs/guides/plugin-authoring.md](guides/plugin-authoring.md) —
+  full plugin manifest + tool / command contract.
