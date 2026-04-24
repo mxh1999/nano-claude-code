@@ -1,10 +1,22 @@
 # `prompts/` — system prompt assets
 
 This directory holds the raw Markdown used to build every system prompt
-CheetahClaws sends to an LLM.  The code in
-[`prompts/select.py`](select.py) loads and routes these files; the
-assembly logic (dynamic blocks, environment info, memory injection)
-lives in [`context.py`](../context.py).
+CheetahClaws sends to an LLM.  [`prompts/select.py`](select.py) loads
+and assembles these files; the higher-level assembly logic (env block,
+memory injection, conditional fragments) lives in
+[`context.py`](../context.py).
+
+## Design: single base + small overlays
+
+```
+final_prompt = base/default.md  +  overlays/<family>.md  (if matched)
+```
+
+Every model starts from the same `default.md` baseline.  Only when a
+model has a **documented, authoritative quirk** do we append a small
+overlay on top.  The previous "one full file per family" design has been
+retired because it duplicated content and silently denied general
+prompt-engineering guidance to families without a dedicated file.
 
 ## Layout
 
@@ -14,65 +26,75 @@ prompts/
 ├── select.py              # pick_base_prompt + load_fragment (lru_cache'd)
 ├── README.md              # this file
 ├── base/
-│   ├── default.md         # fallback — used for any model not matched by family
-│   ├── anthropic.md       # Claude family
-│   ├── openai.md          # GPT / o1 / o3 / o4 / codex
-│   ├── gemini.md          # Gemini family
-│   ├── kimi.md            # Moonshot Kimi
-│   └── deepseek.md        # DeepSeek chat + reasoner (see note below)
+│   └── default.md         # the shared baseline for every model
+├── overlays/
+│   ├── claude.md          # XML-tag preference (Anthropic guide)
+│   ├── gemini.md          # explicit "Agentic Mode" framing (Gemini 3 guide)
+│   └── openai-reasoning.md # don't narrate CoT (o1 / o3 / o4 / gpt-5-codex)
 └── fragments/
     ├── tmux.md            # appended when tmux is available
     └── plan.md            # appended when permission_mode == "plan"
 ```
 
-## Routing — by model family, not by provider
+## Routing — by model family, not by provider/runtime
 
-`pick_base_prompt(provider, model_id)` returns the base prompt for the
-**model family**, not the runtime or API gateway.  Qwen-3 served by
-Alibaba DashScope, Ollama on your laptop, vLLM on a GPU cluster, or
-OpenRouter is the same model — it gets the same prompt regardless of
-how it's being served.
+`pick_base_prompt(provider, model_id)` returns the assembled
+`default.md` + matched overlay (if any).  Overlay matching is a
+case-insensitive substring check against the **last path segment** of
+`model_id` (so `custom/anthropic/claude-sonnet-4-5` strips to
+`claude-sonnet-4-5` and matches `claude`).
 
-Concretely: matching is a case-insensitive substring check against the
-**last path segment** of `model_id` (so `custom/anthropic/claude-sonnet-4-5`
-strips to `claude-sonnet-4-5` and matches `claude`).  See `_FAMILY_RULES`
-in [`select.py`](select.py) for the authoritative order.
+The `provider` argument is consulted only as a fallback when `model_id`
+is empty.  Runtime providers (`ollama`, `lmstudio`, `custom`) are never
+a prompt dimension — Qwen-3 served by DashScope, Ollama, vLLM, or
+OpenRouter is the same model and gets the same prompt.  Tested by
+`test_runtime_is_irrelevant_for_family_routing` and
+`test_ollama_md_is_not_shipped`.
 
-The `provider` argument is consulted **only as a fallback** when
-`model_id` is empty or carries no family keyword (e.g. unusual custom
-deployments).  We deliberately do **not** ship a `ollama.md` or similar
-runtime-level prompt — if the model family can't be identified, the
-honest fallback is `default.md`, not "pretend it's a small local
-model".
+## What lives in `default.md` vs an overlay
 
-### Current state
+`default.md` holds **everything that benefits every model**:
 
-- `default.md` is the stable baseline.  Changing it invalidates the
-  regression golden fixture — do so deliberately.
-- `anthropic.md`, `openai.md`, `gemini.md` carry **family-specific**
-  content sourced from each provider's public prompt-engineering
-  guidance (Anthropic XML-tag structuring + "keep solutions minimal";
-  OpenAI CTCO framework + explicit stop conditions; Gemini explicit
-  agentic-mode loop + parallel-batching emphasis).
-- `deepseek.md` and `kimi.md` currently duplicate `default.md`
-  byte-for-byte; they will differentiate when concrete quirks emerge
-  from real-model testing.
+- Identity, capabilities, full tool catalog
+- "Lead with the answer", "be concise", "no conversational filler"
+- "Keep solutions minimal" (don't over-engineer)
+- "Maximize parallel tool calls", "Read before Edit", "Glob vs Grep vs Read"
+- "Trust your internal reasoning, do not narrate"
+- Stop conditions, safe-vs-unsafe action list
+- Multi-agent guidelines, plan-mode protocol
 
-Families that don't yet have a dedicated file (Qwen, Llama, Mistral,
-Gemma, Phi, GLM, MiniMax) route to `default.md`.  When a concrete
-difference emerges, add `base/<family>.md` and enable the
-commented-out entry in `_FAMILY_RULES`.
+An **overlay** is allowed only when:
 
-### 150-line soft cap
+1. There is an **authoritative source** (vendor prompting guide URL) for
+   the quirk.  The file must cite it in a top-of-file `<!-- Source: -->`
+   comment.  Tested by `test_overlay_cites_source`.
+2. The content does **not** duplicate anything already in `default.md`.
+3. The overlay is **≤ 20 lines**.  Tested by `test_overlay_under_line_cap`.
 
-Keep base prompts **under ~150 lines**.  Rationale (from the [Gemini 3
-prompting guide](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/start/gemini-3-prompting-guide)):
+Examples that meet the bar:
+
+| Overlay | Quirk | Source |
+|---|---|---|
+| `claude.md` | XML tags around structured sections | Anthropic prompt-engineering guide |
+| `gemini.md` | Explicit "Agentic Mode" framing + 4-step loop | Gemini 3 prompting guide |
+| `openai-reasoning.md` | Don't narrate "Let me think step by step…" | OpenAI reasoning best practices |
+
+Examples that do **not** meet the bar (would be rejected):
+
+- "Use markdown headings" — already in default
+- "Be helpful and accurate" — folklore, not vendor-documented
+- "Always run tests before claiming done" — applies to every model
+
+## 150-line cap on `default.md`
+
+Rationale (from the [Gemini 3 prompting guide](https://ai.google.dev/gemini-api/docs/prompting-strategies)):
 
 > "Once a system instruction becomes a 300-line constitution, you can
 > no longer tell what's working and what's superstition."
 
-If a prompt is getting long, extract the long-lived parts into a
-`fragments/*.md` file and append it conditionally from
+CheetahClaws sets a stricter cap at 150 lines on `default.md` and 20
+lines per overlay.  If `default.md` is getting long, extract long-lived
+conditional content into `fragments/*.md` and append it from
 `build_system_prompt()`.
 
 ## Fragments
@@ -83,19 +105,22 @@ contain `{placeholder}` tokens that the caller formats at render time
 `context._render_plan_fragment`).  Literal `{` / `}` in a fragment must
 be doubled (`{{` / `}}`).
 
-Base prompts **must not** use placeholders — they are loaded verbatim.
-Per-run environment data (`date`, `cwd`, git info, CLAUDE.md) is
+`default.md` and overlays must NOT use placeholders — they are loaded
+verbatim.  Per-run environment data (date, cwd, git info, CLAUDE.md) is
 rendered separately by `context._render_env_block` and appended to the
-base prompt.
+base.
 
-## Adding a new model family
+## Adding a new family overlay
 
-1. Add `base/<family>.md` (copy `default.md` as a starting point,
-   then differentiate).
-2. Add a new rule tuple to `_FAMILY_RULES` in [`select.py`](select.py).
-   Put more-specific keywords before broader ones in the same tuple.
-3. Add a case to `tests/test_prompt_selection.py::test_model_family_routing`
-   with a representative model ID.
+1. Identify the quirk + locate the **vendor prompting guide URL** that
+   documents it.  No URL = no overlay.
+2. Write `overlays/<family>.md`.  Top comment must be the source link.
+   Body ≤ 20 lines.  Do not repeat anything from `default.md`.
+3. Add an entry to `_OVERLAY_RULES` in [`select.py`](select.py).
+   Put more-specific keywords before broader ones.
+4. Add a parametrized case to
+   `tests/test_prompt_selection.py::test_overlay_routing` and update
+   `test_overlays_directory_has_expected_files`.
 
 ## Adding a new fragment
 
@@ -109,26 +134,23 @@ base prompt.
   through `pick_base_prompt` / `load_fragment` so the cache stays
   coherent.
 - **Don't put runtime state** (current cwd, git branch, CLAUDE.md) into
-  a base prompt.  Those live in `context._render_env_block` and are
-  assembled fresh every turn.
-- **Don't route by provider / runtime.**  A runtime ("ollama",
-  "lmstudio", "custom", "vllm") is *how* a model is served; a family
-  ("claude", "qwen", "deepseek") is *what* the model is.  Prompts
-  follow the latter.
-- **Don't introduce a template engine** (jinja2, mustache, ...).  The
-  design is deliberately "plain Markdown + maybe `.format()` on one
-  explicit placeholder" — anything richer belongs in a separate RFC.
+  base or overlay files.  Those live in `context._render_env_block` and
+  are assembled fresh every turn.
+- **Don't route by provider/runtime.**  Runtime ("ollama", "lmstudio",
+  "custom", "vllm") is *how* a model is served; family ("claude",
+  "qwen", "deepseek") is *what* the model is.  Prompts follow family.
+- **Don't introduce a template engine** (jinja2, mustache, …).  Plain
+  Markdown + `.format()` on one explicit placeholder is the design;
+  anything richer belongs in a separate RFC.
+- **Don't write a full per-family base file again.**  Family content
+  goes in `overlays/`.  The dead-file regression test
+  (`test_dead_family_base_files_are_gone`) prevents this.
 
 ## Known gaps
 
 - **DeepSeek-R1** recommends *no* system prompt (all instructions in
   the user role).  Supporting that requires a bypass mechanism in
-  `providers.py`; tracked separately.  `deepseek.md` is V3-oriented for
-  now.
-- **OpenAI reasoning models** (o1/o3/gpt-5-codex) may benefit from a
-  separate `openai-reasoning.md`, analogous to opencode's `beast.txt`.
-  Not yet split; will be tackled when the first concrete need appears.
-- **Many open-source families have no dedicated file yet** (Qwen,
-  Llama, Mistral, Gemma, Phi, GLM, MiniMax).  They fall through to
-  `default.md`.  The first family file to add once concrete quirks
-  are observed will likely be `qwen.md`.
+  `providers.py`; tracked separately.  No overlay for now.
+- **Many open-source families** (Qwen, Llama, Mistral, Gemma, Phi, GLM,
+  MiniMax) currently fall through to `default.md`.  Add an overlay when
+  a concrete vendor-documented quirk emerges — not before.

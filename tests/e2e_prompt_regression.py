@@ -99,6 +99,38 @@ def _regenerate() -> None:
     print(f"Wrote {len(prompt)} chars to {_FIXTURE}")
 
 
+def test_env_block_separates_platform_from_git_info(tmp_path, monkeypatch):
+    """Regression: the Platform line must end in \\n so a non-empty git_info
+    (which itself starts with "- Git branch:" without a leading newline)
+    doesn't get glued onto the Platform line.
+
+    Catches the bug where ``- Platform: Linux`` and ``- Git branch: main``
+    rendered as ``- Platform: Linux- Git branch: main`` on the same line.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(_context, "get_memory_context", lambda: "")
+    monkeypatch.setattr(_context, "get_git_info",
+                         lambda: "- Git branch: main\n- Recent commits:\n  abc123 first\n")
+    monkeypatch.setattr(_context, "get_claude_md",      lambda: "")
+    monkeypatch.setattr(_context, "get_platform_hints", lambda: "")
+    monkeypatch.setattr(_context, "_tmux_available",    lambda: False)
+
+    cfg = {"model": "qwen/Qwen3-MAX", "_session_id": "regression-test"}
+    prompt = _context.build_system_prompt(cfg)
+
+    # The Platform line must terminate before "- Git branch:" begins.
+    assert "- Platform: " in prompt
+    assert "- Git branch: main" in prompt
+    # Crucially: no line should contain BOTH Platform and Git branch.
+    glued = [ln for ln in prompt.splitlines()
+             if "- Platform:" in ln and "- Git branch:" in ln]
+    assert not glued, (
+        "Platform line is glued to git info on the same line — "
+        "_render_env_block must keep the trailing \\n on the Platform line.\n"
+        f"Offending line(s): {glued}"
+    )
+
+
 if __name__ == "__main__":
     if "--regenerate" in sys.argv:
         _regenerate()

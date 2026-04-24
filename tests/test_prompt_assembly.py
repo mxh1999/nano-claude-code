@@ -111,8 +111,17 @@ def test_assembly_order_is_base_then_env_then_memory_then_plan(monkeypatch):
     assert idx_identity < idx_env < idx_memory < idx_tmux < idx_plan
 
 
-def test_missing_config_defaults_to_anthropic():
-    """build_system_prompt(None) should still produce a usable prompt."""
+def test_missing_config_falls_back_to_default():
+    """build_system_prompt(None) must produce a usable prompt that uses the
+    neutral default.md baseline — NOT a family-specific file like
+    anthropic.md.  Falling back to a Claude-styled prompt would silently
+    apply XML-tag structuring etc. to whatever model picked it up later.
+    """
+    from prompts import select as _select
     prompt = _context.build_system_prompt(None)
     assert "CheetahClaws" in prompt
     assert "# Environment" in prompt
+    default_body = (_select._BASE_DIR / "default.md").read_text(encoding="utf-8")
+    # The base portion of the prompt must match default.md verbatim, so
+    # we can assert by checking the prompt starts with default's opening line.
+    assert prompt.lstrip().startswith(default_body.splitlines()[0])

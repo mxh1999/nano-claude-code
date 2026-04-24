@@ -1,9 +1,16 @@
 """System prompt assets + selection.
 
-Base prompts live in ``prompts/base/<provider>.md``.  Fragments that are
-conditionally appended (tmux, plan mode) live in ``prompts/fragments/``.
-See ``prompts/README.md`` for contributor guidance (including the 150-line
-per-file cap rationale).
+Design: single shared base + small family overlays.
+
+* ``prompts/base/default.md``     — the shared baseline for every model.
+* ``prompts/overlays/<family>.md`` — appended on top when the model has a
+  documented, authoritative quirk (Anthropic XML tags, Gemini 3 agentic
+  framing, OpenAI reasoning models' no-narration rule).
+* ``prompts/fragments/<name>.md`` — conditionally appended at runtime
+  (tmux available, plan mode active).
+
+See ``prompts/README.md`` for the overlay-admission policy (must cite a
+vendor source) and line-count caps (150 for base, 20 per overlay).
 
 Selection logic is in :mod:`prompts.select`.  Callers should not read .md
 files directly — always go through ``pick_base_prompt`` / ``load_fragment``.

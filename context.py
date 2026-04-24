@@ -3,15 +3,16 @@
 Prompt assembly pipeline:
 
     build_system_prompt(config) -> str
-        = pick_base_prompt(provider)             # prompts/base/<provider>.md
+        = pick_base_prompt(provider, model)      # default.md + matched overlay
         + _render_env_block(config)              # date / cwd / platform / git / CLAUDE.md
         + memory index (if any)
         + tmux fragment (if tmux available)      # prompts/fragments/tmux.md
         + plan mode fragment (if plan active)    # prompts/fragments/plan.md
 
-Base prompts live in ``prompts/base/<provider>.md`` and contain no
-placeholders — they are loaded verbatim.  Dynamic per-run data (date,
-cwd, CLAUDE.md, plan file path) is rendered separately and appended.
+Base + overlay design lives under ``prompts/`` — see ``prompts/README.md``.
+Base/overlay files contain no placeholders and are loaded verbatim.
+Dynamic per-run data (date, cwd, CLAUDE.md, plan file path) is rendered
+separately and appended.
 
 Callers outside this module should only touch ``build_system_prompt``.
 The helper functions (``get_git_info``, ``get_claude_md``,
@@ -160,14 +161,15 @@ def _render_env_block(config: dict | None = None) -> str:
     so the base prompt can remain pure static text.
     """
     import platform as _plat
+    # Trailing \n on the Platform line is load-bearing: get_git_info()
+    # returns content that starts with "- Git branch:" (no leading newline),
+    # so without this \n it concatenates as "Platform: Linux- Git branch:".
     header = (
         "# Environment\n"
         f"- Current date: {datetime.now().strftime('%Y-%m-%d %A')}\n"
         f"- Working directory: {Path.cwd()}\n"
-        f"- Platform: {_plat.system()}"
+        f"- Platform: {_plat.system()}\n"
     )
-    # Concatenate — each helper returns either an empty string or
-    # content that already starts with a newline where appropriate.
     return header + get_platform_hints() + get_git_info() + get_claude_md()
 
 
@@ -202,7 +204,11 @@ def build_system_prompt(config: dict | None = None) -> str:
 
     cfg = config or {}
     model_id = cfg.get("model", "")
-    provider = detect_provider(model_id) if model_id else "anthropic"
+    # No model -> empty provider so pick_base_prompt falls through to
+    # default.md.  The previous "anthropic" fallback silently gave Claude-
+    # styled prompts (XML tags, minimal-scope guard) to whatever model
+    # picked them up later, which is wrong for non-Claude families.
+    provider = detect_provider(model_id) if model_id else ""
 
     parts: list[str] = [
         pick_base_prompt(provider, model_id),
